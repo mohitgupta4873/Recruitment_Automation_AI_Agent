@@ -1,110 +1,100 @@
-# AI Job Posting Agent 🚀
+# Recruito Agent ()
 
-An intelligent AI-powered platform that helps recruiters create compelling job descriptions and automatically post them on LinkedIn using advanced AI models.
+This project is an **AI-augmented recruiting assistant**.  
+It automates a full lightweight hiring funnel for an early-career engineering role.
 
-## ✨ Features
+## What it does
 
-- **AI-Powered Job Description Generation**: Uses Google Gemini AI to create professional, inclusive job descriptions
-- **Interactive Feedback Loop**: Iterative refinement with recruiter feedback
-- **LinkedIn Integration**: Automatic posting to LinkedIn with proper formatting
-- **Modern Web Interface**: Beautiful, responsive frontend for seamless user experience
-- **Smart Content Optimization**: Ensures LinkedIn character limits and formatting requirements
-- **Professional Templates**: Pre-built templates for various job roles and industries
+### 1. Job Description generator
+- Generates an inclusive JD for a given role (0–2 YOE, backend engineer style).
+- Can optionally call an LLM (e.g. Gemini / GPT) to draft or refine.
+- Saved as markdown.
 
-## 🏗️ Architecture
+### 2. Auto-sourcing funnel (Google Workspace automation)
+- Creates a Google Sheet to track applicants.
+- Creates a Google Form with:
+  - Name
+  - Email
+  - YOE
+  - Motivation / “Why are you a fit?”
+  - Resume (Google Drive link to PDF)
+  - LinkedIn URL
+- Injects the JD into the form description so candidates see the role context.
+- Captures the form responder URL.
 
-- **Frontend**: React.js with TypeScript, Tailwind CSS, and modern UI components
-- **Backend**: FastAPI with Python, async support, and RESTful API design
-- **AI Engine**: Google Gemini AI integration with LangGraph for workflow management
-- **Database**: PostgreSQL for user management and job posting history
-- **Authentication**: JWT-based secure authentication system
-- **Deployment**: Docker containerization with CI/CD pipeline
+### 3. Resume ingestion + shortlist
+- Reads form responses via the Google Forms API.
+- For each applicant:
+  - Extracts their resume file ID from a shared Drive link.
+  - Downloads their PDF from Google Drive.
+  - Extracts text from the PDF.
+  - Tries to infer contact email if missing.
+  - Scores them using simple keyword heuristics
+    (e.g. `python`, `rest`, `docker`, `aws`, etc.).
+- Logs all applications to a `Raw` tab in the Sheet.
+- Writes the top N candidates into a `Shortlist` tab with name/email/score.
 
-## 🚀 Quick Start
+### 4. Interview scheduling + calendar invites
+- Takes the shortlist and auto-allocates interview slots (e.g. 45 min + 15 min gap).
+- Builds `.ics` calendar invites with a unique Google Meet link per candidate.
+- Sends each candidate an email + ICS attachment using the Gmail API.
+- Writes an `Invited` tab (ID, email, slot time, status).
 
-### Prerequisites
-- Python 3.9+
-- Node.js 18+
-- PostgreSQL
-- Google Gemini API Key
-- LinkedIn API Access
+### 5. Post-interview outcomes
+- After interviews, you choose who is selected.
+- Automatically:
+  - Sends acceptance emails to selected candidates.
+  - Sends polite regret emails to others.
+  - Logs the outcome (+ Gmail message IDs) into an `Outcome` tab.
 
-### Installation
+## Key modules
 
-1. **Clone the repository**
-```bash
-git clone https://github.com/yourusername/ai-job-posting-agent.git
-cd ai-job-posting-agent
-```
+- `jd_generator.py`  
+  Generate / refine the JD.
 
-2. **Backend Setup**
-```bash
-cd backend
-pip install -r requirements.txt
-cp .env.example .env
-# Edit .env with your API keys
-uvicorn main:app --reload
-```
+- `form_and_sheet.py`  
+  Stand up a Google Form + Google Sheet with the JD and all questions.
 
-3. **Frontend Setup**
-```bash
-cd frontend
-npm install
-npm run dev
-```
+- `ingest_and_rank.py`  
+  Pull responses, download resumes, parse PDFs, extract skills, rank, and write to Sheets.
 
-4. **Database Setup**
-```bash
-# Create database and run migrations
-python manage.py db upgrade
-```
+- `scheduler.py`  
+  Build interview slots and construct `.ics` calendar invites.
 
-## 🔧 Configuration
+- `mailer.py`  
+  Send those invites to candidates via Gmail API.
 
-Create a `.env` file in the backend directory:
+- `outcomes.py`  
+  Send acceptance / regret emails and log outcomes.
 
-```env
-GEMINI_API_KEY=your_gemini_api_key
-LINKEDIN_CLIENT_ID=your_linkedin_client_id
-LINKEDIN_CLIENT_SECRET=your_linkedin_client_secret
-DATABASE_URL=postgresql://user:password@localhost/dbname
-SECRET_KEY=your_secret_key
-```
+- `auth.py`  
+  Central place to build authenticated Google clients.  
+  In real usage, OAuth refresh tokens and API keys live in `config.py`
+  (which is **not** committed). The repo only includes `config_example.py`.
 
-## 📱 Usage
+## Security notes
 
-1. **Login/Register**: Create an account or sign in
-2. **Job Creation**: Input job role and requirements
-3. **AI Generation**: Let AI create a professional job description
-4. **Review & Refine**: Provide feedback for improvements
-5. **LinkedIn Posting**: Automatically post to LinkedIn with one click
+- This repo intentionally does **not** contain:
+  - OAuth tokens
+  - Refresh tokens
+  - Gmail client secrets
+  - API keys
+  - Candidate PII / resumes
 
-## 🛠️ Tech Stack
+- `config_example.py` documents what secrets are expected.
+  You create `config.py` locally with real credentials and never commit it.
 
-- **Frontend**: React, TypeScript, Tailwind CSS, Framer Motion
-- **Backend**: FastAPI, Python, SQLAlchemy, Alembic
-- **AI**: Google Gemini, LangGraph, Pydantic
-- **Database**: PostgreSQL, Redis
-- **Deployment**: Docker, GitHub Actions, Vercel/Railway
+## Why this matters
 
-## 🤝 Contributing
+This project shows:
+- Automated high-volume candidate intake (Forms)
+- Structured candidate evaluation (resume parsing & scoring)
+- Automated scheduling (calendar invites via ICS)
+- Automated communication (Gmail API for invites, accepts, regrets)
+- Sheet-based audit trail for every stage
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Google Gemini AI for powerful language generation
-- LinkedIn API for professional networking integration
-- The open-source community for amazing tools and libraries
-
-## 📞 Support
-
-For support, email support@aijobagent.com or create an issue in this repository.
+In a real setting this reduces manual recruiter work:
+- No copy/paste CVs
+- No back-and-forth scheduling emails
+- Instant shortlists for hiring managers
+- Clean, consistent candidate communication

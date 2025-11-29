@@ -18,7 +18,6 @@ env/
 
 --- Secrets & API Keys (CRITICAL) ---
 
-Never commit these!
 
 token.json
 client_secrets.json

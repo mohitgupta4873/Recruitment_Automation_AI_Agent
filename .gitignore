@@ -1,0 +1,54 @@
+--- Python & Django ---
+
+pycache/
+*.py[cod]
+*$py.class
+db.sqlite3
+*.log
+local_settings.py
+
+--- Virtual Environment ---
+
+Standard names for env folders
+
+venv/
+env/
+.env
+.venv/
+
+--- Secrets & API Keys (CRITICAL) ---
+
+Never commit these!
+
+token.json
+client_secrets.json
+campaign_state.json
+cv_manifest.json
+shortlist.json
+check_models.py
+generate_token.py
+
+--- Media & Uploads ---
+
+We don't want to upload candidate resumes to GitHub
+
+media/
+media/cv_pdfs/
+*.pdf
+
+--- IDE & OS ---
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+--- Google Cloud/Auth ---
+
+Any other credential files
+
+*.json
+!package.json
+!manifest.json
+
+(Allow specific JSONs if you need them later, but exclude general creds)

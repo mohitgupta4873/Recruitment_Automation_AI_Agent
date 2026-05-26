@@ -1,0 +1,384 @@
+{% extends 'hiring_app/base.html' %}
+{% load static %}
+
+{% block title %}
+  {% if campaign_meta and campaign_meta.role != 'New Campaign' %}{{ campaign_meta.role }} — {% endif %}Agent — HireAI
+{% endblock %}
+{% block nav_agent %}active{% endblock %}
+
+{% block content %}
+<div style="padding-top:64px; min-height:100vh; display:flex;">
+
+  <!-- ══════════════════════════════════════════
+       LEFT SIDEBAR — Campaign History
+  ══════════════════════════════════════════ -->
+  <aside id="campaign-sidebar" style="
+    width:260px;
+    flex-shrink:0;
+    border-right:1px solid var(--border);
+    display:flex;
+    flex-direction:column;
+    background:rgba(5,8,22,0.7);
+    backdrop-filter:blur(16px);
+    position:sticky;
+    top:64px;
+    height:calc(100vh - 64px);
+    overflow:hidden;
+  ">
+
+    <!-- Sidebar Header -->
+    <div style="padding:1.25rem 1rem 0.75rem; border-bottom:1px solid var(--border);">
+      <div class="flex items-center justify-between mb-2">
+        <span style="font-size:0.7rem; font-weight:700; text-transform:uppercase; letter-spacing:0.1em; color:var(--text-muted);">
+          Campaigns
+        </span>
+        <a href="{% url 'new_campaign' %}" class="btn btn-primary btn-sm" style="padding:0.3rem 0.7rem; font-size:0.75rem;">
+          + New
+        </a>
+      </div>
+    </div>
+
+    <!-- Current Campaign -->
+    <div style="padding:0.75rem 1rem; border-bottom:1px solid var(--border);">
+      <div style="font-size:0.65rem; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-muted); margin-bottom:0.5rem;">Current</div>
+      <div style="
+        padding:0.6rem 0.75rem;
+        background:rgba(124,58,237,0.12);
+        border:1px solid rgba(124,58,237,0.3);
+        border-radius:var(--radius-sm);
+      ">
+        <div style="font-size:0.82rem; font-weight:700; color:#a78bfa; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+          {% if campaign_meta %}{{ campaign_meta.role }}{% else %}New Campaign{% endif %}
+        </div>
+        <div style="font-size:0.7rem; color:var(--text-muted); margin-top:2px;">
+          {% if campaign_meta %}
+            {% if campaign_meta.status == 'active' %}🟢 Active
+            {% elif campaign_meta.status == 'completed' %}✅ Completed
+            {% elif campaign_meta.status == 'draft' %}📝 Draft
+            {% else %}⏸️ Paused{% endif %}
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <!-- History List -->
+    <div style="flex:1; overflow-y:auto; padding:0.75rem 1rem;">
+      {% if history %}
+        <div style="font-size:0.65rem; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-muted); margin-bottom:0.5rem;">History</div>
+        {% for c in history %}
+        {% if c.status != 'draft' %}
+        <a href="{% url 'switch_campaign' c.id %}" style="
+          display:block;
+          padding:0.6rem 0.75rem;
+          border-radius:var(--radius-sm);
+          margin-bottom:0.35rem;
+          border:1px solid transparent;
+          transition:var(--transition);
+          text-decoration:none;
+        " onmouseover="this.style.background='var(--bg-card-hover)'; this.style.borderColor='var(--border)';"
+           onmouseout="this.style.background='transparent'; this.style.borderColor='transparent';">
+          <div style="display:flex; align-items:center; gap:6px;">
+            <span style="font-size:0.75rem;">
+              {% if c.status == 'active' %}🟢{% elif c.status == 'completed' %}✅{% else %}⏸️{% endif %}
+            </span>
+            <span style="font-size:0.82rem; font-weight:500; color:var(--text-secondary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1;">
+              {{ c.role }}
+            </span>
+          </div>
+          <div style="font-size:0.7rem; color:var(--text-muted); margin-top:2px; padding-left:1.15rem;">
+            👥 {{ c.candidates_count }} · {{ c.created_at|slice:":10" }}
+          </div>
+        </a>
+        {% endif %}
+        {% endfor %}
+      {% else %}
+        <div style="text-align:center; padding:1.5rem 0; color:var(--text-muted); font-size:0.78rem;">
+          No other campaigns yet
+        </div>
+      {% endif %}
+    </div>
+
+    <!-- Bottom nav -->
+    <div style="padding:0.75rem 1rem; border-top:1px solid var(--border);">
+      <a href="{% url 'dashboard' %}" class="sidebar-item">
+        <span>◀</span> Dashboard
+      </a>
+    </div>
+  </aside>
+
+  <!-- ══════════════════════════════════════════
+       MAIN CONTENT
+  ══════════════════════════════════════════ -->
+  <main style="flex:1; overflow-y:auto; max-width:100%;">
+    <div style="padding:2rem; max-width:900px;">
+
+      <!-- Campaign Header Bar -->
+      <div class="flex items-center justify-between mb-4 animate-fade-up">
+        <div>
+          <h1 style="font-size:1.4rem; font-weight:800; letter-spacing:-0.025em;">
+            {% if campaign_meta and campaign_meta.role != 'New Campaign' %}
+              {{ campaign_meta.role }}
+            {% else %}
+              🤖 New Campaign
+            {% endif %}
+          </h1>
+          <div style="font-size:0.8rem; color:var(--text-muted); margin-top:2px;">
+            Campaign ID: <code style="font-size:0.75rem; color:var(--text-muted);">{{ campaign_id }}</code>
+          </div>
+        </div>
+
+        <div class="flex gap-2 items-center">
+          {% if state.form_url %}
+            <a href="{{ state.form_url }}" target="_blank" class="btn btn-sm btn-outline">📝 Form</a>
+            <a href="{{ state.sheet_url }}" target="_blank" class="btn btn-sm btn-outline">📊 Sheet</a>
+          {% endif %}
+          <a href="{% url 'new_campaign' %}" class="btn btn-sm btn-primary">✨ New Campaign</a>
+        </div>
+      </div>
+
+      <!-- Active campaign banner -->
+      {% if state.form_url %}
+      <div class="campaign-banner animate-fade-up mb-3">
+        <div class="flex items-center gap-2">
+          <span class="badge badge-green"><span class="dot"></span> Live</span>
+          <span class="campaign-banner-text">Campaign for <strong>{{ current_role }}</strong> is live and accepting applications</span>
+        </div>
+      </div>
+      {% endif %}
+
+      <!-- ═══════════════════════════════════
+           STEP 1: Define Role & JD
+      ════════════════════════════════════ -->
+      <div class="card animate-fade-up mb-3" id="step-jd" style="border-left:3px solid #7c3aed;">
+        <div class="step-header">
+          <div class="step-number purple">1</div>
+          <div>
+            <div class="step-title">Define Role & Generate JD</div>
+            <div class="step-desc">Enter the role and experience level — Gemini AI will draft a professional job description instantly.</div>
+          </div>
+        </div>
+
+        <form action="{% url 'generate_jd' %}" method="post">
+          {% csrf_token %}
+          <div style="display:grid; grid-template-columns:1fr 180px auto; gap:0.75rem; align-items:end;">
+            <div class="form-group" style="margin-bottom:0;">
+              <label class="form-label">Role Title</label>
+              <input type="text" name="role" class="form-control"
+                     placeholder="e.g. Backend Engineer, Data Scientist"
+                     value="{% if role_preview %}{{ role_preview }}{% else %}{{ current_role }}{% endif %}" required>
+            </div>
+            <div class="form-group" style="margin-bottom:0;">
+              <label class="form-label">Experience</label>
+              <input type="text" name="experience" class="form-control"
+                     placeholder="e.g. 2 years"
+                     value="{{ exp_preview|default:'' }}" required>
+            </div>
+            <button type="submit" class="btn btn-primary" id="generate-btn">
+              ✨ Generate JD
+            </button>
+          </div>
+        </form>
+
+        <!-- JD Preview & Campaign Launch -->
+        {% if jd_preview %}
+        <div class="divider"></div>
+        <form action="{% url 'create_campaign' %}" method="post">
+          {% csrf_token %}
+          <input type="hidden" name="role" value="{{ role_preview }}">
+
+          <div class="form-group">
+            <label class="form-label">📄 Review & Edit Job Description</label>
+            <textarea name="jd_text" class="form-control" rows="10"
+                      style="font-family:inherit; font-size:0.875rem; line-height:1.65;">{{ jd_preview }}</textarea>
+          </div>
+
+          <div class="card mb-3" style="background:rgba(99,102,241,0.06); border-color:rgba(99,102,241,0.2);">
+            <div class="flex items-center gap-2 mb-2">
+              <span>💼</span>
+              <span style="font-size:0.875rem; font-weight:600;">LinkedIn Post</span>
+              <span class="badge badge-gray">Optional</span>
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem;">
+              <div class="form-group" style="margin-bottom:0;">
+                <label class="form-label">Access Token</label>
+                <input type="text" name="linkedin_token" class="form-control" placeholder="Bearer …">
+              </div>
+              <div class="form-group" style="margin-bottom:0;">
+                <label class="form-label">Author URN</label>
+                <input type="text" name="linkedin_urn" class="form-control" placeholder="urn:li:person:…">
+              </div>
+            </div>
+          </div>
+
+          <button type="submit" class="btn btn-success btn-full">
+            🚀 Launch Campaign & Post to LinkedIn
+          </button>
+        </form>
+        {% endif %}
+      </div>
+
+      <!-- ═══════════════════════════════════
+           STEP 2: Sync
+      ════════════════════════════════════ -->
+      {% if state.form_url and not jd_preview %}
+      <div class="card animate-fade-up mb-3" id="step-sync" style="border-left:3px solid #06b6d4;">
+        <div class="step-header">
+          <div class="step-number cyan">2</div>
+          <div>
+            <div class="step-title">Sync Responses & Parse CVs</div>
+            <div class="step-desc">Pulls applicants from Google Forms, downloads resumes, and AI-scores them.</div>
+          </div>
+        </div>
+        <div class="flex items-center gap-3 flex-wrap">
+          <div style="flex:1; font-size:0.82rem; color:var(--text-muted);">
+            Synced: <strong style="color:var(--text-primary);">{{ candidates|length }} candidate{{ candidates|length|pluralize }}</strong>
+          </div>
+          <a href="{% url 'sync_responses' %}" class="btn btn-amber">🔄 Sync Now</a>
+        </div>
+      </div>
+      {% endif %}
+
+      <!-- ═══════════════════════════════════
+           STEP 3 & 4: Candidates
+      ════════════════════════════════════ -->
+      {% if candidates %}
+      <div id="step-candidates">
+
+        <!-- 3A: Schedule Interviews -->
+        <div class="card animate-fade-up mb-3" id="step-3a" style="border-left:3px solid #f59e0b;">
+          <div class="step-header">
+            <div class="step-number amber">3</div>
+            <div>
+              <div class="step-title">Schedule Interviews</div>
+              <div class="step-desc">Select candidates and send Google Calendar invites via Gmail.</div>
+            </div>
+          </div>
+
+          <form action="{% url 'send_invites' %}" method="post">
+            {% csrf_token %}
+            <div class="flex items-center gap-3 mb-3 flex-wrap">
+              <div class="flex items-center gap-2" style="flex:1; min-width:240px;">
+                <span style="font-size:0.82rem; color:var(--text-muted); white-space:nowrap;">Date & Time</span>
+                <input type="datetime-local" name="interview_date" class="form-control" required style="max-width:260px;">
+              </div>
+              <button type="submit" class="btn btn-danger">📅 Send Invites</button>
+            </div>
+
+            <div style="border:1px solid var(--border); border-radius:var(--radius-md); overflow:hidden;">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th class="checkbox-col">
+                      <input type="checkbox" id="selectAll" class="fancy-check" title="Select all">
+                    </th>
+                    <th>Email</th>
+                    <th>AI Score</th>
+                    <th>Resume Preview</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for c in candidates %}
+                  <tr>
+                    <td class="checkbox-col">
+                      <input type="checkbox" name="selected_candidates" value="{{ c.email }}" class="fancy-check candidate-checkbox">
+                    </td>
+                    <td style="font-weight:500; color:var(--text-primary);">{{ c.email }}</td>
+                    <td>
+                      {% if c.score > 3 %}<span class="badge badge-green">⭐ {{ c.score }}/5</span>
+                      {% elif c.score > 1 %}<span class="badge badge-amber">{{ c.score }}/5</span>
+                      {% else %}<span class="badge badge-gray">{{ c.score }}/5</span>{% endif %}
+                    </td>
+                    <td style="max-width:260px;">
+                      <span style="font-size:0.75rem; color:var(--text-muted);">{{ c.text_preview|truncatechars:70 }}</span>
+                    </td>
+                    <td>
+                      {% if c.drive_link %}
+                      <a href="{{ c.drive_link }}" target="_blank" class="btn btn-ghost btn-sm btn-icon" title="View CV">📄</a>
+                      {% endif %}
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </form>
+        </div>
+
+        <!-- 3B: Final Decisions -->
+        <div class="card animate-fade-up mb-3" id="step-outcomes" style="border-left:3px solid #10b981;">
+          <div class="step-header">
+            <div class="step-number green">4</div>
+            <div>
+              <div class="step-title">Final Decisions — Hire or Reject</div>
+              <div class="step-desc">Checked → Offer email. Unchecked → Rejection email. All logged in Google Sheet.</div>
+            </div>
+          </div>
+
+          <div class="alert alert-warning mb-3">
+            ⚠️ <strong>Irreversible:</strong> This sends emails to all {{ candidates|length }} candidate{{ candidates|length|pluralize }}.
+          </div>
+
+          <form action="{% url 'send_outcomes' %}" method="post">
+            {% csrf_token %}
+            <div style="border:1px solid var(--border); border-radius:var(--radius-md); overflow:hidden; margin-bottom:1.25rem;">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th class="checkbox-col">Hire ✓</th>
+                    <th>Email</th>
+                    <th>Score</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for c in candidates %}
+                  <tr>
+                    <td class="checkbox-col">
+                      <input type="checkbox" name="hired_candidates" value="{{ c.email }}" class="fancy-check">
+                    </td>
+                    <td style="font-weight:500; color:var(--text-primary);">{{ c.email }}</td>
+                    <td>
+                      {% if c.score > 3 %}<span class="badge badge-green">⭐ {{ c.score }}/5</span>
+                      {% elif c.score > 1 %}<span class="badge badge-amber">{{ c.score }}/5</span>
+                      {% else %}<span class="badge badge-gray">{{ c.score }}/5</span>{% endif %}
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            <button type="submit" class="btn btn-primary btn-full"
+              data-confirm="Send offer/rejection emails to all {{ candidates|length }} candidates? This cannot be undone.">
+              🏁 Finalize — Send All Decisions
+            </button>
+          </form>
+        </div>
+
+      </div>
+      {% endif %}
+
+    </div><!-- /inner padding -->
+  </main>
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+  // Loading states on form submit
+  document.querySelectorAll('form').forEach(form => {
+    form.addEventListener('submit', function() {
+      const btn = form.querySelector('[type="submit"]:not([data-confirm])');
+      if (!btn) return;
+      const t = btn.textContent;
+      btn.disabled = true;
+      btn.style.opacity = '0.7';
+      if (t.includes('Generate')) btn.textContent = '✨ Generating…';
+      else if (t.includes('Launch'))  btn.textContent = '🚀 Launching…';
+      else if (t.includes('Sync'))    btn.textContent = '🔄 Syncing…';
+      else if (t.includes('Invite') || t.includes('Invite')) btn.textContent = '📅 Sending…';
+      else btn.textContent = '⏳ Processing…';
+    });
+  });
+</script>
+{% endblock %}

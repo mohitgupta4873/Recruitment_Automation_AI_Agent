@@ -1,28 +1,23 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Error - AI Hiring Agent</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-</head>
-<body class="bg-light">
-    <div class="container py-5">
-        <div class="row justify-content-center">
-            <div class="col-md-8">
-                <div class="card border-danger shadow">
-                    <div class="card-header bg-danger text-white">
-                        <h4 class="mb-0">⚠️ Something went wrong</h4>
-                    </div>
-                    <div class="card-body">
-                        <p class="lead text-danger">The application encountered an error:</p>
-                        <div class="alert alert-secondary font-monospace">
-                            {{ error }}
-                        </div>
-                        
-                        <a href="/" class="btn btn-primary mt-3">Return to Dashboard</a>
-                    </div>
-                </div>
-            </div>
-        </div>
+{% extends 'hiring_app/base.html' %}
+
+{% block title %}Error — HireAI{% endblock %}
+
+{% block content %}
+<div style="min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 2rem;">
+  <div class="card" style="max-width: 480px; text-align: center; padding: 3rem 2rem; border-color: rgba(220,38,38,0.25);">
+    <div style="font-size: 3rem; margin-bottom: 1rem;">⚠️</div>
+    <h1 style="font-size: 1.4rem; font-weight: 700; margin-bottom: 0.75rem;">Something went wrong</h1>
+    <p style="color: var(--text-muted); font-size: 0.875rem; margin-bottom: 2rem; line-height: 1.7;">
+      {% if error_message %}
+        {{ error_message }}
+      {% else %}
+        An unexpected error occurred. Please try again or return to the dashboard.
+      {% endif %}
+    </p>
+    <div style="display: flex; gap: 0.75rem; justify-content: center;">
+      <a href="{% url 'dashboard' %}" class="btn btn-primary">← Dashboard</a>
+      <a href="{% url 'agent' %}" class="btn btn-outline">Try Agent</a>
     </div>
-</body>
-</html>
+  </div>
+</div>
+{% endblock %}

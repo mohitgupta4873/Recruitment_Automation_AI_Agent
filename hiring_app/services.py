@@ -19,6 +19,9 @@ from pypdf import PdfReader
 import google.generativeai as genai
 from django.conf import settings
 
+import logging
+logger = logging.getLogger('hiring_app')
+
 SCOPES = [
     "https://www.googleapis.com/auth/forms.body",
     "https://www.googleapis.com/auth/forms.responses.readonly",
@@ -28,23 +31,33 @@ SCOPES = [
 ]
 
 class HiringAutomator:
-    def __init__(self, token_path='token.json', state_path='campaign_state.json'):
+    def __init__(self, token_path='token.json', state_path='campaign_state.json', creds=None):
         self.state_path = state_path
-        self.creds = None
-        
-        if os.path.exists(token_path):
-            self.creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-        else:
-            print(f"⚠️ Warning: {token_path} not found.")
+        self.creds = creds  # accept pre-built credentials (per-user OAuth)
+
+        # Fall back to token.json file if no creds injected
+        if self.creds is None:
+            if os.path.exists(token_path):
+                try:
+                    self.creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+                except Exception as e:
+                    logger.error(f"Failed to load token.json: {e}")
+            else:
+                logger.warning(f"token.json not found at {token_path}")
 
         if self.creds:
-            self.forms = build("forms", "v1", credentials=self.creds, cache_discovery=False)
-            self.sheets = build("sheets", "v4", credentials=self.creds, cache_discovery=False)
-            self.drive = build("drive", "v3", credentials=self.creds, cache_discovery=False)
-            self.gmail = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
-        
+            try:
+                self.forms  = build("forms",  "v1", credentials=self.creds, cache_discovery=False)
+                self.sheets = build("sheets", "v4", credentials=self.creds, cache_discovery=False)
+                self.drive  = build("drive",  "v3", credentials=self.creds, cache_discovery=False)
+                self.gmail  = build("gmail",  "v1", credentials=self.creds, cache_discovery=False)
+            except Exception as e:
+                logger.error(f"Failed to build Google API clients: {e}")
+                self.creds = None
+
         if hasattr(settings, 'GEMINI_API_KEY') and settings.GEMINI_API_KEY:
             genai.configure(api_key=settings.GEMINI_API_KEY)
+
 
     def load_state(self):
         if os.path.exists(self.state_path):

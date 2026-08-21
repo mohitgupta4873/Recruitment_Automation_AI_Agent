@@ -31,19 +31,27 @@ logger = logging.getLogger('hiring_app')
 # Google OAuth helpers
 # ─────────────────────────────────────────────────────────────
 
-def _build_oauth_flow(request, state=None):
-    """Build a google_auth_oauthlib Flow from env var or file."""
+def _build_oauth_flow(request, state=None, code_verifier=None):
+    """Build a google_auth_oauthlib Flow from env var or file.
+
+    code_verifier must be passed in on the callback leg (retrieved from the
+    session) so it matches the PKCE code_challenge sent on the initial
+    authorization request — google-auth-oauthlib auto-generates a fresh
+    code_verifier per Flow instance otherwise, and since the callback builds
+    a separate Flow object from the one that started the flow, the token
+    exchange would be missing it (Google error: "Missing code verifier").
+    """
     redirect_uri = request.build_absolute_uri('/google/oauth2callback/')
     client_secrets_json = getattr(settings, 'GOOGLE_CLIENT_SECRETS', '')
 
     if client_secrets_json:
         # Production: secrets stored as JSON env var
         client_config = json.loads(client_secrets_json)
-        flow = Flow.from_client_config(client_config, scopes=SCOPES, state=state)
+        flow = Flow.from_client_config(client_config, scopes=SCOPES, state=state, code_verifier=code_verifier)
     else:
         # Development: use client_secrets.json file
         secrets_file = os.path.join(settings.BASE_DIR, 'client_secrets.json')
-        flow = Flow.from_client_secrets_file(secrets_file, scopes=SCOPES, state=state)
+        flow = Flow.from_client_secrets_file(secrets_file, scopes=SCOPES, state=state, code_verifier=code_verifier)
 
     flow.redirect_uri = redirect_uri
     return flow
@@ -173,6 +181,7 @@ def google_connect(request):
             prompt='consent',   # Always ask for consent to get refresh_token
         )
         request.session['google_oauth_state'] = state
+        request.session['google_oauth_code_verifier'] = flow.code_verifier
         return redirect(authorization_url)
     except FileNotFoundError:
         logger.error("client_secrets.json not found and GOOGLE_CLIENT_SECRETS env var not set")
@@ -192,8 +201,9 @@ def google_connect(request):
 def google_oauth_callback(request):
     """Handle Google OAuth2 callback — save token to DB."""
     state = request.session.get('google_oauth_state')
+    code_verifier = request.session.get('google_oauth_code_verifier')
     try:
-        flow = _build_oauth_flow(request, state=state)
+        flow = _build_oauth_flow(request, state=state, code_verifier=code_verifier)
         flow.fetch_token(authorization_response=request.build_absolute_uri(request.get_full_path()))
         creds = flow.credentials
 
@@ -201,6 +211,8 @@ def google_oauth_callback(request):
             user=request.user,
             defaults={'token_json': creds.to_json()},
         )
+        request.session.pop('google_oauth_state', None)
+        request.session.pop('google_oauth_code_verifier', None)
         logger.info(f"Google account connected for user: {request.user.username}")
         return redirect('agent')
     except Exception as e:

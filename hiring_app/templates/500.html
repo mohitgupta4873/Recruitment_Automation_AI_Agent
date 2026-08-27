@@ -1,0 +1,43 @@
+{# Deliberately standalone: no {% extends %}, no {% url %}, no DB access. #}
+{# A 500 page must render even when the database or template context is the #}
+{# thing that broke, so it cannot depend on base.html or context processors. #}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Something went wrong — HireAI</title>
+  <style>
+    body {
+      margin: 0; min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      background: #050816; color: #e2e8f0;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      padding: 2rem;
+    }
+    .box {
+      max-width: 480px; text-align: center;
+      padding: 3rem 2rem; border-radius: 16px;
+      background: rgba(15, 23, 42, 0.7);
+      border: 1px solid rgba(220, 38, 38, 0.25);
+    }
+    h1 { font-size: 1.4rem; margin: 0 0 0.75rem; }
+    p { color: #94a3b8; font-size: 0.9rem; line-height: 1.7; margin: 0 0 2rem; }
+    a {
+      display: inline-block; padding: 0.6rem 1.4rem; border-radius: 8px;
+      background: #7c3aed; color: #fff; text-decoration: none; font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <div style="font-size:3rem; margin-bottom:1rem;">⚠️</div>
+    <h1>Something went wrong</h1>
+    <p>
+      An unexpected error occurred on our side. It has been logged and we're
+      looking into it. Nothing you sent has been lost.
+    </p>
+    <a href="/dashboard/">Back to dashboard</a>
+  </div>
+</body>
+</html>

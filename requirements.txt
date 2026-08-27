@@ -1,15 +1,41 @@
-Django==5.2.8
-google-api-python-client>=2.100.0
-google-auth-httplib2>=0.1.1
-google-auth-oauthlib>=1.1.0
-google-generativeai>=0.8.0
-whitenoise>=6.12.0
-gunicorn>=26.0.0
-dj-database-url>=3.1.2
-django-environ>=0.13.0
-django-ratelimit>=4.1.0
-psycopg2-binary>=2.9.12
-python-dateutil>=2.9.0
-pypdf>=4.0.0
-requests>=2.32.0
+# Pinned exactly. Unbounded ">=" meant two consecutive deploys could install
+# different versions, and a breaking or compromised upstream release would ship
+# straight to production. pypdf matters most here: it parses untrusted,
+# applicant-supplied PDFs.
+#
+# To upgrade: bump deliberately, run `manage.py test`, then commit.
 
+# ── Framework ────────────────────────────────────────────────
+Django==5.2.8
+gunicorn==26.1.0
+whitenoise==6.12.0
+
+# ── Config & database ────────────────────────────────────────
+django-environ==0.14.0
+dj-database-url==3.1.2
+psycopg2-binary==2.9.12
+
+# ── Rate limiting (needs a shared cache — see CACHES in settings.py) ──
+django-ratelimit==4.1.0
+redis==5.0.4
+
+# ── Field-level encryption (GoogleOAuthToken.token_json) ──────
+# Was previously only a transitive dep of google-auth; now imported directly
+# by hiring_app/models.py, so it's pinned explicitly.
+cryptography==46.0.5
+
+# ── Google APIs ──────────────────────────────────────────────
+google-api-python-client==2.109.0
+google-auth==2.49.1
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
+
+# NOTE: google-generativeai is end-of-life upstream and emits a FutureWarning on
+# import. Migrating to the `google-genai` package is tracked as follow-up work;
+# pinning holds it stable until then.
+google-generativeai==0.8.6
+
+# ── Parsing & utilities ──────────────────────────────────────
+pypdf==5.1.0
+python-dateutil==2.9.0
+requests==2.32.5

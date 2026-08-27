@@ -1,0 +1,23 @@
+{% extends 'hiring_app/base.html' %}
+
+{% block title %}Applications closed — HireAI{% endblock %}
+
+{% block content %}
+<div class="auth-page">
+  <div class="auth-card" style="max-width: 480px; text-align: center;">
+
+    <div style="font-size: 3rem; margin-bottom: 1rem;">🚪</div>
+    <h1 class="auth-heading">
+      {% if campaign.status == 'draft' %}Not open yet{% else %}Applications closed{% endif %}
+    </h1>
+    <p class="auth-subheading">
+      {% if campaign.status == 'draft' %}
+        This role isn't accepting applications yet. Check back soon.
+      {% else %}
+        This role is no longer accepting applications.
+      {% endif %}
+    </p>
+
+  </div>
+</div>
+{% endblock %}

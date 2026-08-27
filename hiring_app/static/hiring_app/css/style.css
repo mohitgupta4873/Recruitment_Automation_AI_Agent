@@ -520,6 +520,50 @@ input[type="checkbox"].fancy-check:checked::after {
 input[type="checkbox"].fancy-check:hover { border-color: var(--accent-purple); }
 
 /* ============================================================
+   APPLY PAGE
+   ============================================================ */
+.field-error {
+  color: #fca5a5;
+  font-size: 0.78rem;
+  margin-top: 0.35rem;
+}
+
+.apply-jd-details {
+  margin-bottom: 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem 1rem;
+}
+
+.apply-jd-details summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.apply-jd-text {
+  margin-top: 0.75rem;
+  font-size: 0.85rem;
+  line-height: 1.65;
+  color: var(--text-muted);
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.apply-consent-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  line-height: 1.5;
+}
+
+.apply-consent-label input { flex-shrink: 0; margin-top: 2px; }
+
+/* ============================================================
    STEP CARDS (Agent Page)
    ============================================================ */
 .step-section {
@@ -592,6 +636,113 @@ input[type="checkbox"].fancy-check:hover { border-color: var(--accent-purple); }
   border: 1px solid rgba(16,185,129,0.25);
   color: #6ee7b7;
 }
+
+.alert-info {
+  background: rgba(59,130,246,0.1);
+  border: 1px solid rgba(59,130,246,0.25);
+  color: #93c5fd;
+}
+
+/* Flash message container rendered by base.html.
+   Fixed overlay rather than an in-flow block: .navbar is position:fixed and
+   each page applies its own padding-top to clear it, so an in-flow banner at
+   the top of <body> renders *underneath* the navbar. */
+.messages {
+  position: fixed;
+  top: 74px;
+  right: 1.5rem;
+  z-index: 200;
+  width: min(420px, calc(100vw - 3rem));
+}
+
+/* The base .alert backgrounds are translucent, which is fine inside a card but
+   unreadable floating over page content. Opaque base + accent tint. */
+.messages .alert {
+  background-color: #0f172a;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.55);
+  backdrop-filter: blur(12px);
+  align-items: center;
+}
+
+.messages .alert-warning { background-image: linear-gradient(rgba(245,158,11,0.14), rgba(245,158,11,0.14)); }
+.messages .alert-danger  { background-image: linear-gradient(rgba(220,38,38,0.16),  rgba(220,38,38,0.16)); }
+.messages .alert-success { background-image: linear-gradient(rgba(16,185,129,0.14), rgba(16,185,129,0.14)); }
+.messages .alert-info    { background-image: linear-gradient(rgba(59,130,246,0.14), rgba(59,130,246,0.14)); }
+
+.alert-icon { flex-shrink: 0; }
+
+/* ============================================================
+   GOOGLE CONNECT (navbar)
+   ============================================================ */
+.google-connect-btn svg {
+  width: 16px;
+  height: 16px;
+  background: #fff;
+  border-radius: 50%;
+  padding: 1px;
+  flex-shrink: 0;
+}
+
+.google-connected {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.google-connected form { margin: 0; }
+.google-connected-check { color: #10b981; font-weight: 700; }
+
+.google-disconnect {
+  background: none;
+  border: none;
+  padding: 0;
+  margin-left: 0.25rem;
+  font-size: 0.75rem;
+  color: #f87171;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.google-disconnect:hover { color: #ef4444; }
+
+/* State-changing actions are POST forms, not links. This keeps a submit button
+   sitting in a flex row exactly where its anchor used to. */
+.inline-form { display: inline-flex; margin: 0; }
+
+.alert-close {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: inherit;
+  opacity: 0.6;
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 0.25rem;
+}
+
+.alert-close:hover { opacity: 1; }
+
+/* ============================================================
+   FOOTER
+   ============================================================ */
+.site-footer {
+  display: flex;
+  justify-content: center;
+  gap: 1.25rem;
+  flex-wrap: wrap;
+  padding: 2rem 1.5rem;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  border-top: 1px solid rgba(255,255,255,0.06);
+  margin-top: 3rem;
+}
+
+.site-footer a { color: var(--text-muted); text-decoration: none; }
+.site-footer a:hover { color: var(--accent-purple); }
 
 /* ============================================================
    DIVIDER

@@ -1,0 +1,18 @@
+{% extends 'hiring_app/base.html' %}
+
+{% block title %}Application received — HireAI{% endblock %}
+
+{% block content %}
+<div class="auth-page">
+  <div class="auth-card" style="max-width: 480px; text-align: center;">
+
+    <div style="font-size: 3rem; margin-bottom: 1rem;">✅</div>
+    <h1 class="auth-heading">Application received</h1>
+    <p class="auth-subheading">
+      Thanks for applying to <strong>{{ campaign.role }}</strong>. The hiring team
+      will review your application and reach out if there's a match.
+    </p>
+
+  </div>
+</div>
+{% endblock %}

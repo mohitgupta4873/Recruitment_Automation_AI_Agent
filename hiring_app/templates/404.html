@@ -1,0 +1,16 @@
+{% extends 'hiring_app/base.html' %}
+
+{% block title %}Page not found — HireAI{% endblock %}
+
+{% block content %}
+<div style="min-height: 70vh; display: flex; align-items: center; justify-content: center; padding: 2rem;">
+  <div class="card" style="max-width: 480px; text-align: center; padding: 3rem 2rem;">
+    <div style="font-size: 3rem; margin-bottom: 1rem;">🔍</div>
+    <h1 style="font-size: 1.4rem; font-weight: 700; margin-bottom: 0.75rem;">Page not found</h1>
+    <p style="color: var(--text-muted); font-size: 0.875rem; margin-bottom: 2rem; line-height: 1.7;">
+      That page doesn't exist, or the campaign you're looking for isn't yours.
+    </p>
+    <a href="{% url 'landing' %}" class="btn btn-primary">← Back to home</a>
+  </div>
+</div>
+{% endblock %}

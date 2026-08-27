@@ -1,53 +1,52 @@
---- Python & Django ---
-
-pycache/
+# ── Python & Django ──────────────────────────────────────────
+__pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
 db.sqlite3
-*.log
+db.sqlite3-journal
 local_settings.py
+staticfiles/
+logs/
+*.log
 
---- Virtual Environment ---
-
-Standard names for env folders
-
+# ── Virtual environments ─────────────────────────────────────
 venv/
-env/
-.env
 .venv/
+env/
+ENV/
 
---- Secrets & API Keys (CRITICAL) ---
-
-
+# ── Secrets & credentials (CRITICAL) ─────────────────────────
+# Never commit these. Production reads the same values from real env vars.
+.env
+.env.*
+!.env.example
 token.json
 client_secrets.json
+credentials.json
+*.pem
+*.key
+
+# ── Candidate data (PII) ─────────────────────────────────────
+# Resumes and campaign state contain personal data belonging to applicants.
+media/
+campaigns/
 campaign_state.json
 cv_manifest.json
 shortlist.json
-check_models.py
-generate_token.py
-
---- Media & Uploads ---
-
-We don't want to upload candidate resumes to GitHub
-
-media/
-media/cv_pdfs/
 *.pdf
 
---- IDE & OS ---
+# ── Local scratch ────────────────────────────────────────────
+generate_token.py
+check_model.py
+check_models.py
 
+# ── Local planning docs (not for the public repo) ────────────
+ROADMAP.md
+
+# ── IDE & OS ─────────────────────────────────────────────────
 .vscode/
 .idea/
+*.swp
 .DS_Store
 Thumbs.db
-
---- Google Cloud/Auth ---
-
-Any other credential files
-
-*.json
-!package.json
-!manifest.json
-
-(Allow specific JSONs if you need them later, but exclude general creds)

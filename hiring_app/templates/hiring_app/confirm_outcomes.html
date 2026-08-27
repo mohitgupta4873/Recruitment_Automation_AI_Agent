@@ -1,0 +1,70 @@
+{% extends 'hiring_app/base.html' %}
+
+{% block title %}Confirm outcome emails — HireAI{% endblock %}
+
+{% block content %}
+<div class="auth-page">
+  <div class="auth-card" style="max-width:640px;">
+
+    <h1 class="auth-heading">Confirm outcome emails</h1>
+    <p class="auth-subheading">
+      This sends real email to every candidate in this campaign and cannot be undone.
+    </p>
+
+    {# .auth-error is display:flex, so its children become flex items — the #}
+    {# inline <strong> counts must sit inside a single child, not beside it. #}
+    <div class="auth-error" style="text-align:left;">
+      <span>
+        <strong>{{ offer_count }}</strong> offer email{{ offer_count|pluralize }}
+        and <strong>{{ reject_count }}</strong> rejection email{{ reject_count|pluralize }}
+        will be sent.
+        {% if reject_count %}
+        Everyone not selected as hired receives a rejection.
+        {% endif %}
+      </span>
+    </div>
+
+    {% if hired_emails %}
+    <div class="form-group">
+      <label class="form-label">Receiving an offer</label>
+      <ul style="margin:0; padding-left:1.2rem;">
+        {% for email in hired_emails %}
+        <li>{{ email }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    <form method="post" action="{% url 'send_outcomes' campaign_id %}">
+      {% csrf_token %}
+      {% for email in hired_emails %}
+      <input type="hidden" name="hired_candidates" value="{{ email }}">
+      {% endfor %}
+
+      <div class="form-group">
+        <label class="form-label" for="confirm-input">
+          Type <code>SEND</code> to confirm
+        </label>
+        <input
+          type="text"
+          id="confirm-input"
+          name="confirm"
+          class="form-control"
+          placeholder="SEND"
+          autocomplete="off"
+          required
+        >
+      </div>
+
+      <button type="submit" class="btn btn-danger btn-full">
+        Send {{ total_count }} email{{ total_count|pluralize }}
+      </button>
+    </form>
+
+    <p class="auth-footer">
+      <a href="{% url 'campaign_agent' campaign_id %}">Cancel and go back</a>
+    </p>
+
+  </div>
+</div>
+{% endblock %}

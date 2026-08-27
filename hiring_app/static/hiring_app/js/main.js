@@ -83,6 +83,20 @@ document.querySelectorAll('.alert[data-autohide]').forEach(alert => {
   }, 4000);
 });
 
+// ── Manual alert dismiss ─────────────────────────────────────
+// Flash messages are not auto-hidden: an error the user missed is worse than
+// one that lingers, so they stay until dismissed.
+document.querySelectorAll('.alert-close').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const alert = btn.closest('.alert');
+    if (!alert) return;
+    alert.style.opacity = '0';
+    alert.style.transform = 'translateY(-8px)';
+    alert.style.transition = 'all 0.3s ease';
+    setTimeout(() => alert.remove(), 300);
+  });
+});
+
 // ── Typing animation for hero heading ────────────────────────
 const typingEl = document.getElementById('typing-text');
 if (typingEl) {

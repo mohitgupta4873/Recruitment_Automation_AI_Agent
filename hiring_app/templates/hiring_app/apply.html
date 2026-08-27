@@ -1,0 +1,95 @@
+{% extends 'hiring_app/base.html' %}
+{% load static %}
+
+{% block title %}Apply — {{ campaign.role }} — HireAI{% endblock %}
+{% block meta_desc %}Apply for {{ campaign.role }}.{% endblock %}
+
+{% block content %}
+<div class="auth-page">
+  <div class="auth-card" style="max-width: 560px;">
+
+    <div class="auth-logo">
+      <div class="auth-logo-icon">🤖</div>
+      <span class="auth-logo-text">HireAI</span>
+    </div>
+
+    <h1 class="auth-heading">{{ campaign.role }}</h1>
+    <p class="auth-subheading">Fill in your details and attach your resume to apply.</p>
+
+    {% if campaign.jd_text %}
+    <details class="apply-jd-details">
+      <summary>View the full job description</summary>
+      <div class="apply-jd-text">{{ campaign.jd_text|linebreaks }}</div>
+    </details>
+    {% endif %}
+
+    {% if form.non_field_errors %}
+    <div class="auth-error">⚠️ {{ form.non_field_errors|join:" " }}</div>
+    {% endif %}
+
+    <form method="post" enctype="multipart/form-data" novalidate>
+      {% csrf_token %}
+
+      <div class="form-group">
+        <label class="form-label" for="{{ form.full_name.id_for_label }}">{{ form.full_name.label }}</label>
+        {{ form.full_name }}
+        {% for e in form.full_name.errors %}<div class="field-error">{{ e }}</div>{% endfor %}
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="{{ form.email.id_for_label }}">Email</label>
+        {{ form.email }}
+        {% for e in form.email.errors %}<div class="field-error">{{ e }}</div>{% endfor %}
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="{{ form.years_experience.id_for_label }}">{{ form.years_experience.label }}</label>
+        {{ form.years_experience }}
+        {% for e in form.years_experience.errors %}<div class="field-error">{{ e }}</div>{% endfor %}
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="{{ form.why_fit.id_for_label }}">{{ form.why_fit.label }}</label>
+        {{ form.why_fit }}
+        {% for e in form.why_fit.errors %}<div class="field-error">{{ e }}</div>{% endfor %}
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="{{ form.resume.id_for_label }}">{{ form.resume.label }}</label>
+        {{ form.resume }}
+        {% for e in form.resume.errors %}<div class="field-error">{{ e }}</div>{% endfor %}
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="{{ form.linkedin_url.id_for_label }}">{{ form.linkedin_url.label }}</label>
+        {{ form.linkedin_url }}
+        {% for e in form.linkedin_url.errors %}<div class="field-error">{{ e }}</div>{% endfor %}
+      </div>
+
+      <div class="form-group apply-consent">
+        <label class="apply-consent-label">
+          {{ form.consent }}
+          <span>{{ form.consent.label }}</span>
+        </label>
+        {% for e in form.consent.errors %}<div class="field-error">{{ e }}</div>{% endfor %}
+      </div>
+
+      <button type="submit" class="btn btn-primary btn-full" id="apply-submit">
+        🚀 Submit Application
+      </button>
+    </form>
+
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+  document.querySelector('form').addEventListener('submit', function () {
+    const btn = document.getElementById('apply-submit');
+    btn.disabled = true;
+    btn.style.opacity = '0.7';
+    btn.textContent = '⏳ Submitting…';
+  });
+</script>
+{% endblock %}

@@ -14,9 +14,10 @@
         <h1 class="page-title">Welcome back, {{ user.username }} 👋</h1>
         <p class="page-subtitle">Your AI-powered recruitment command center.</p>
       </div>
-      <a href="{% url 'new_campaign' %}" class="btn btn-primary">
-        ✨ New Campaign
-      </a>
+      <form method="post" action="{% url 'new_campaign' %}" class="inline-form">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-primary">✨ New Campaign</button>
+      </form>
     </div>
 
     <!-- ── Stats ── -->
@@ -59,7 +60,10 @@
           <h2 style="font-size:1rem; font-weight:700; color:var(--text-secondary);">
             All Campaigns
           </h2>
-          <a href="{% url 'new_campaign' %}" class="btn btn-sm btn-outline">+ New</a>
+          <form method="post" action="{% url 'new_campaign' %}" class="inline-form">
+            {% csrf_token %}
+            <button type="submit" class="btn btn-sm btn-outline">+ New</button>
+          </form>
         </div>
 
         {% if campaigns %}
@@ -81,7 +85,7 @@
                       {{ c.role }}
                     </div>
                     <div style="font-size:0.75rem; color:var(--text-muted); margin-top:1px;">
-                      Created {{ c.created_at|slice:":10" }}
+                      Created {{ c.created_at|date:"Y-m-d" }}
                     </div>
                   </div>
                 </div>
@@ -95,9 +99,7 @@
                     <span class="badge badge-amber">Paused</span>
                   {% endif %}
 
-                  <a href="{% url 'switch_campaign' c.id %}" class="btn btn-sm btn-outline">
-                    Open →
-                  </a>
+                  <a href="{% url 'campaign_agent' c.id %}" class="btn btn-sm btn-outline">Open →</a>
                 </div>
               </div>
 
@@ -106,8 +108,8 @@
                 <div style="font-size:0.8rem; color:var(--text-muted);">
                   👥 <strong style="color:var(--text-secondary);">{{ c.candidates_count }}</strong> candidates
                 </div>
-                {% if c.form_url %}
-                <a href="{{ c.form_url }}" target="_blank" style="font-size:0.8rem; color:var(--accent-cyan);">📝 Form</a>
+                {% if c.status != 'draft' %}
+                <a href="{% url 'apply' c.public_token %}" target="_blank" style="font-size:0.8rem; color:var(--accent-cyan);">🔗 Apply Link</a>
                 {% endif %}
                 {% if c.sheet_url %}
                 <a href="{{ c.sheet_url }}" target="_blank" style="font-size:0.8rem; color:var(--accent-cyan);">📊 Sheet</a>
@@ -124,7 +126,10 @@
             <div style="font-size:0.82rem; color:var(--text-muted); margin-bottom:1.5rem;">
               Start your first AI-powered recruitment campaign
             </div>
-            <a href="{% url 'new_campaign' %}" class="btn btn-primary">Launch First Campaign</a>
+            <form method="post" action="{% url 'new_campaign' %}" class="inline-form">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-primary">Launch First Campaign</button>
+            </form>
           </div>
         {% endif %}
       </div>
@@ -138,20 +143,19 @@
             <div class="card-title">Quick Actions</div>
           </div>
           <div style="display:flex; flex-direction:column; gap:0.5rem;">
-            <a href="{% url 'new_campaign' %}" class="quick-action-card" style="flex-direction:row; align-items:center; gap:0.75rem; padding:0.9rem 1rem;">
-              <span style="font-size:1.3rem;">✨</span>
-              <div>
-                <div style="font-size:0.875rem; font-weight:600; color:var(--text-primary);">New Campaign</div>
-                <div style="font-size:0.75rem; color:var(--text-muted);">Start fresh pipeline</div>
-              </div>
-            </a>
-            <a href="{% url 'sync_responses' %}" class="quick-action-card" style="flex-direction:row; align-items:center; gap:0.75rem; padding:0.9rem 1rem;">
-              <span style="font-size:1.3rem;">🔄</span>
-              <div>
-                <div style="font-size:0.875rem; font-weight:600; color:var(--text-primary);">Sync Responses</div>
-                <div style="font-size:0.75rem; color:var(--text-muted);">Pull latest applicants</div>
-              </div>
-            </a>
+            <form method="post" action="{% url 'new_campaign' %}">
+              {% csrf_token %}
+              <button type="submit" class="quick-action-card" style="width:100%; flex-direction:row; align-items:center; gap:0.75rem; padding:0.9rem 1rem; text-align:left; font:inherit; color:inherit; cursor:pointer;">
+                <span style="font-size:1.3rem;">✨</span>
+                <div>
+                  <div style="font-size:0.875rem; font-weight:600; color:var(--text-primary);">New Campaign</div>
+                  <div style="font-size:0.75rem; color:var(--text-muted);">Start fresh pipeline</div>
+                </div>
+              </button>
+            </form>
+            {# "Sync Responses" used to live here as a one-click POST. As of   #}
+            {# Phase 2 there's no sync step at all — candidates arrive live   #}
+            {# via the public apply page, not a batch pull from a Google Form.#}
             <a href="{% url 'agent' %}" class="quick-action-card" style="flex-direction:row; align-items:center; gap:0.75rem; padding:0.9rem 1rem;">
               <span style="font-size:1.3rem;">🤖</span>
               <div>

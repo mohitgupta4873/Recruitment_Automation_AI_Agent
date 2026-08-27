@@ -1,20 +1,20 @@
-import os
-import json
 import base64
+import io
+import json
 import re
 import uuid
-import io
-import email.utils
-import requests
 from datetime import datetime, timedelta
 from dateutil import tz
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+from django.core.files.base import ContentFile
+from django.core.mail import EmailMessage, send_mail
+from django.utils import timezone
+
 # Google Libraries
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.errors import HttpError
 from pypdf import PdfReader
 import google.generativeai as genai
 from django.conf import settings
@@ -22,352 +22,422 @@ from django.conf import settings
 import logging
 logger = logging.getLogger('hiring_app')
 
+# As of Phase 2, Forms and Drive are gone entirely — applicants upload a PDF
+# directly (see forms.py:ApplicationForm) instead of pasting a Drive link into
+# a Google Form question. Sheets stays (optional export) and gmail.send stays
+# (sending as the recruiter). Both are "sensitive" scopes; neither is
+# "restricted" the way the old drive scope was, which is what let Phase 2
+# happen without a paid CASA security assessment for OAuth verification.
 SCOPES = [
-    "https://www.googleapis.com/auth/forms.body",
-    "https://www.googleapis.com/auth/forms.responses.readonly",
-    "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/gmail.send",
 ]
 
-class HiringAutomator:
-    def __init__(self, token_path='token.json', state_path='campaign_state.json', creds=None):
-        self.state_path = state_path
-        self.creds = creds  # accept pre-built credentials (per-user OAuth)
+# Applicant-uploaded resumes are untrusted input. ApplicationForm.clean_resume
+# rejects anything over this before it reaches the ORM; kept here too since
+# _extract_text loads the whole file into memory regardless of who called it.
+MAX_RESUME_BYTES = 5 * 1024 * 1024   # 5 MB
 
-        # Fall back to token.json file if no creds injected
-        if self.creds is None:
-            if os.path.exists(token_path):
-                try:
-                    self.creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-                except Exception as e:
-                    logger.error(f"Failed to load token.json: {e}")
-            else:
-                logger.warning(f"token.json not found at {token_path}")
+# Used to score a resume when a campaign has no AI-derived scoring_keywords —
+# either generate_scoring_keywords failed (Gemini down, bad response) or the
+# campaign predates it (imported by import_legacy_campaigns). Not tied to any
+# particular role; better than scoring 0 across the board.
+FALLBACK_KEYWORDS = ["python", "django", "api", "sql", "rest", "docker", "java", "node", "aws"]
+
+
+class ResumeTooLarge(Exception):
+    """Raised when a candidate's resume exceeds MAX_RESUME_BYTES."""
+
+
+class JDGenerationFailed(Exception):
+    """Raised when the Gemini call for JD generation fails."""
+
+
+class HiringAutomator:
+    """
+    Wraps the (now optional) Google API calls — Sheets export, Gmail send —
+    plus Gemini JD generation and resume scoring. As of Phase 1, persistence
+    goes through the Campaign/Candidate models via the ORM. As of Phase 2,
+    Google is optional throughout: every method that used to require it now
+    has a non-Google fallback (Django's configured EMAIL_BACKEND for sending,
+    silently skipping for the Sheets export). See CLAUDE.md for the fuller
+    history — Forms and Drive integration were removed entirely this phase.
+
+    Constructed per-request with the *current user's* Google credentials, or
+    None. It's not a singleton and holds no cross-request state of its own.
+    """
+
+    def __init__(self, creds=None):
+        self.creds = creds
+        self.sheets = self.gmail = None
 
         if self.creds:
             try:
-                self.forms  = build("forms",  "v1", credentials=self.creds, cache_discovery=False)
                 self.sheets = build("sheets", "v4", credentials=self.creds, cache_discovery=False)
-                self.drive  = build("drive",  "v3", credentials=self.creds, cache_discovery=False)
                 self.gmail  = build("gmail",  "v1", credentials=self.creds, cache_discovery=False)
             except Exception as e:
                 logger.error(f"Failed to build Google API clients: {e}")
                 self.creds = None
 
-        if hasattr(settings, 'GEMINI_API_KEY') and settings.GEMINI_API_KEY:
-            genai.configure(api_key=settings.GEMINI_API_KEY)
+    @property
+    def has_google(self):
+        return self.creds is not None and self.gmail is not None
 
-
-    def load_state(self):
-        if os.path.exists(self.state_path):
-            try: return json.load(open(self.state_path))
-            except: return {}
-        return {}
-
-    def save_state(self, new_data):
-        state = self.load_state()
-        state.update(new_data)
-        with open(self.state_path, "w") as f:
-            json.dump(state, f, indent=2)
-        return state
-
-    # --- STEP 1: JD GENERATION (Uses Experience + Lite Model) ---
+    # --- JD GENERATION ---
     def generate_jd(self, role_title, experience):
         prompt = f"""Draft an inclusive, crisp Job Description for: {role_title}.
 Required Experience: {experience}.
 Include: About the role, Responsibilities, Must-haves, Nice-to-haves, What we offer, How to apply.
 Aim ~350–450 words. Bullets welcome."""
-        
+
+        if not getattr(settings, 'GEMINI_API_KEY', ''):
+            raise JDGenerationFailed("Gemini is not configured on this server.")
         try:
-            model = genai.GenerativeModel("gemini-2.5-flash-lite") 
+            model = genai.GenerativeModel("gemini-2.5-flash-lite")
             resp = model.generate_content(prompt)
             return resp.text
         except Exception as e:
-            return f"# {role_title}\n\n(AI Failed. Write manually.\nExp: {experience})"
+            # Surface the failure so the view can tell the user, instead of
+            # returning a placeholder that reads like a successful result.
+            logger.error(f"Gemini JD generation failed for role={role_title!r}: {e}")
+            raise JDGenerationFailed(str(e)) from e
 
-    # --- NEW: LINKEDIN POSTING ---
-    def post_to_linkedin(self, access_token, author_urn, role, jd_text, form_url):
-        if not access_token or not author_urn: return None
-        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json", "X-Restli-Protocol-Version": "2.0.0"}
-        post_text = f"🚀 We're hiring: {role}\n\nApply here: {form_url}\n\n{jd_text[:1000]}..."
-        payload = {
-            "author": author_urn,
-            "lifecycleState": "PUBLISHED",
-            "specificContent": {"com.linkedin.ugc.ShareContent": {"shareCommentary": {"text": post_text}, "shareMediaCategory": "NONE"}},
-            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"}
-        }
+    def generate_scoring_keywords(self, role_title, jd_text):
+        """Ask Gemini for the short list of skills/keywords resumes should be
+        scored against for this role. Never raises — keyword generation
+        failing must not block launching a campaign — falls back to
+        FALLBACK_KEYWORDS on any error or unparseable response.
+        """
+        if not getattr(settings, 'GEMINI_API_KEY', ''):
+            return list(FALLBACK_KEYWORDS)
+        prompt = f"""Based on this job description for "{role_title}", list 8-15 \
+specific skills or keywords a strong resume should mention (tools, languages, \
+frameworks, methodologies — not soft skills like "communication").
+
+Job description:
+{jd_text[:3000]}
+
+Respond with ONLY a JSON array of lowercase strings, nothing else. Example:
+["python", "django", "postgresql", "rest api", "docker"]"""
         try:
-            resp = requests.post("https://api.linkedin.com/v2/ugcPosts", headers=headers, json=payload)
-            if resp.status_code in (200, 201): return resp.json().get("id")
-        except: pass
-        return None
+            model = genai.GenerativeModel("gemini-2.5-flash-lite")
+            resp = model.generate_content(prompt)
+            keywords = _parse_keyword_response(resp.text)
+            if keywords:
+                return keywords
+            logger.warning(f"Gemini returned no usable keywords for role={role_title!r}; using fallback")
+        except Exception as e:
+            logger.warning(f"Scoring keyword generation failed for role={role_title!r}: {e}")
+        return list(FALLBACK_KEYWORDS)
 
-    # --- STEP 2: CAMPAIGN CREATION (Clears old candidates) ---
-    def create_campaign(self, role_title, jd_text, linkedin_token=None, linkedin_urn=None):
-        # 1. Create Sheet & Form
-        ss = self.sheets.spreadsheets().create(body={"properties": {"title": f"Applications — {role_title}"}}).execute()
-        sheet_id = ss["spreadsheetId"]
-        sheet_url = ss["spreadsheetUrl"]
+    # --- CAMPAIGN CREATION ---
+    def create_campaign(self, campaign, jd_text):
+        """Finalise `campaign`: store the JD, derive scoring keywords, go live.
 
-        fm = self.forms.forms().create(body={"info": {"title": f"Application — {role_title}"}}).execute()
-        form_id = fm["formId"]
+        `campaign` is an already-saved Campaign row (owner/role already set,
+        public_token already generated by the model default). Mutates and
+        saves it in place. Google is entirely optional here — if connected, a
+        tracking Sheet is created best-effort; if not, the campaign still
+        launches and is fully usable through the apply page alone.
+        """
+        campaign.jd_text = jd_text
+        campaign.scoring_keywords = self.generate_scoring_keywords(campaign.role, jd_text)
+        campaign.status = 'active'
 
-        # Questions
-        desc = jd_text[:3990] + "..." if len(jd_text) > 4000 else jd_text
-        requests = [
-            {"updateFormInfo": {"info": {"description": desc}, "updateMask": "description"}},
-            self._q_text("Full name", 0),
-            self._q_text("Email", 1),
-            self._q_radio("Years of experience", ["0", "1", "2", "3+"], 2),
-            self._q_text(f"Why are you a fit for {role_title}?", 3, paragraph=True),
-            self._q_text("Resume Google Drive link (PDF)", 4, desc="Paste a generic shareable link"),
-            self._q_text("LinkedIn URL", 5, required=False),
-        ]
-        self.forms.forms().batchUpdate(formId=form_id, body={"requests": requests}).execute()
-        
-        meta = self.forms.forms().get(formId=form_id).execute()
-        form_url = meta.get("responderUri")
-        drive_qid = self._get_qid(meta, "Resume Google Drive link (PDF)")
-        email_qid = self._get_qid(meta, "Email")
-
-        # LinkedIn
-        linkedin_post_id = None
-        if linkedin_token and linkedin_urn:
-            linkedin_post_id = self.post_to_linkedin(linkedin_token, linkedin_urn, role_title, jd_text, form_url)
-
-        # SAVE STATE - IMPORTANT: Reset candidates list to [] so new campaign is clean
-        self.save_state({
-            "role": role_title, "form_id": form_id, "form_url": form_url,
-            "sheet_id": sheet_id, "sheet_url": sheet_url,
-            "drive_qid": drive_qid, "email_qid": email_qid,
-            "linkedin_post_id": linkedin_post_id,
-            "processed_ids": [],
-            "candidates": [] # <--- THIS LINE ENSURES ONLY NEW CANDIDATES SHOW
-        })
-        return form_url, sheet_url
-
-    # --- STEP 3: SYNC & PARSE ---
-    def sync_responses(self):
-        state = self.load_state()
-        if 'form_id' not in state: return {"error": "No active campaign"}
-        
-        sheet_id = state.get('sheet_id')
-        processed_ids = set(state.get('processed_ids', []))
-
-        responses = self.forms.forms().responses().list(formId=state['form_id']).execute().get('responses', [])
-        
-        # Load existing for this campaign, default to empty list
-        processed_candidates = state.get('candidates', []) 
-        new_rows = []
-        
-        download_dir = os.path.join(settings.MEDIA_ROOT, 'cv_pdfs')
-        os.makedirs(download_dir, exist_ok=True)
-
-        for resp in responses:
-            resp_id = resp['responseId']
-            if resp_id in processed_ids: continue 
-
-            email = self._get_answer(resp, state.get('email_qid')) or resp.get('respondentEmail')
-            drive_link = self._get_answer(resp, state.get('drive_qid'))
-            create_time = resp.get('createTime')
-            
-            score = 0
-            text_preview = "No PDF"
-            status = "No Link"
-
-            if drive_link:
-                file_id = self._extract_file_id(drive_link)
-                if file_id:
-                    status = "Downloaded"
-                    local_path = os.path.join(download_dir, f"{file_id}.pdf")
-                    if not os.path.exists(local_path):
-                        self._download_file(file_id, local_path)
-                    
-                    text = self._extract_text(local_path)
-                    score = self._score_text(text)
-                    text_preview = text[:200]
-                    
-                    processed_candidates.append({
-                        "id": resp_id, "email": email, "file_id": file_id,
-                        "score": score, "text_preview": text_preview, "drive_link": drive_link
-                    })
-            
-            new_rows.append([resp_id, create_time, email, score, status, drive_link or ""])
-            processed_ids.add(resp_id)
-
-        if new_rows:
+        if self.has_google:
             try:
-                self.sheets.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={
-                    "requests": [{"addSheet": {"properties": {"title": "Responses"}}}]
-                }).execute()
-                header = [["Response ID", "Time", "Email", "AI Score", "Status", "Resume Link"]]
-                self.sheets.spreadsheets().values().append(
-                    spreadsheetId=sheet_id, range="Responses!A1", valueInputOption="RAW", body={"values": header}
+                ss = self.sheets.spreadsheets().create(
+                    body={"properties": {"title": f"Applications — {campaign.role}"}}
                 ).execute()
-            except: pass 
+                campaign.sheet_id = ss["spreadsheetId"]
+                campaign.sheet_url = ss["spreadsheetUrl"]
+                self._ensure_sheet_tab(campaign.sheet_id, "Applications",
+                                        ["Applied At", "Full Name", "Email", "Experience", "AI Score", "Status"])
+            except HttpError as e:
+                # Sheet export is a nice-to-have, not a launch blocker.
+                logger.warning(f"Could not create tracking sheet for campaign={campaign.pk}: {e}")
 
-            self.sheets.spreadsheets().values().append(
-                spreadsheetId=sheet_id, range="Responses!A1", valueInputOption="RAW", body={"values": new_rows}
-            ).execute()
+        campaign.save()
+        return campaign
 
-        state['processed_ids'] = list(processed_ids)
-        state['candidates'] = processed_candidates
-        self.save_state(state)
-        return processed_candidates
+    # --- APPLICATIONS (replaces Phase 1's sync_responses — see CLAUDE.md) ---
+    def process_application(self, campaign, cleaned_data):
+        """Score `cleaned_data['resume']` (an UploadedFile) against
+        `campaign.scoring_keywords` and create/update the Candidate row.
 
-    # --- STEP 4 & 5 (Invites & Outcomes) ---
-    def send_invites(self, candidate_emails, organizer_name, interview_date):
-        state = self.load_state()
-        role = state.get('role', 'Role')
+        update_or_create rather than create: a second submission from the same
+        email updates the existing application instead of colliding with the
+        (campaign, email) unique constraint — a candidate correcting a typo'd
+        resume, say. Matches the precedent set by Phase 1's sync_responses.
+        """
+        uploaded = cleaned_data['resume']
+        file_content = uploaded.read()
+
+        text = self._extract_text(file_content)
+        keywords = campaign.scoring_keywords or FALLBACK_KEYWORDS
+        score, matched = self._score_resume(text, keywords)
+        resume_status = 'parsed' if text else 'parse_failed'
+
+        candidate, _created = campaign.candidates.update_or_create(
+            email=cleaned_data['email'],
+            defaults={
+                'source': 'apply_page',
+                'full_name': cleaned_data.get('full_name', ''),
+                'years_experience': cleaned_data.get('years_experience', ''),
+                'why_fit': cleaned_data.get('why_fit', ''),
+                'linkedin_url': cleaned_data.get('linkedin_url', '') or '',
+                'consent_at': timezone.now(),
+                'score': score,
+                'matched_terms': matched,
+                'text_preview': (text[:200] or "No extractable text") if text else "Resume could not be read",
+                'resume_status': resume_status,
+            },
+        )
+        candidate.resume.save(f"{uuid.uuid4().hex}.pdf", ContentFile(file_content), save=True)
+
+        if self.has_google and campaign.sheet_id:
+            self._append_candidate_row(campaign.sheet_id, candidate)
+
+        return candidate
+
+    # --- INTERVIEW INVITES ---
+    def send_invites(self, campaign, candidates, organizer_name, interview_date):
+        """candidates: an iterable of Candidate rows belonging to `campaign`.
+        Sends via Gmail if the recruiter has connected Google, otherwise via
+        Django's configured EMAIL_BACKEND (see DEFAULT_FROM_EMAIL) — Google is
+        optional for every step of this app as of Phase 2.
+        """
+        role = campaign.role
         results = []
-        try: dt_start = datetime.strptime(interview_date, "%Y-%m-%dT%H:%M")
-        except ValueError: dt_start = datetime.strptime(interview_date, "%Y-%m-%dT%H:%M:%S")
+        dt_start = self._parse_interview_datetime(interview_date)
+        sender_email = self._sender_email()
 
-        sender_email = "recruiter@example.com"
-        try:
-            profile = self.gmail.users().getProfile(userId='me').execute()
-            sender_email = profile.get('emailAddress', sender_email)
-        except: pass
-
-        for i, email_addr in enumerate(candidate_emails):
-            slot_time = dt_start + timedelta(minutes=i*45)
-            ics_content = self._make_ics(organizer_name, sender_email, "Candidate", email_addr, role, slot_time)
+        for i, candidate in enumerate(candidates):
+            slot_time = dt_start + timedelta(minutes=i * 45)
+            local_slot = timezone.localtime(slot_time)
+            greeting = f"Hi {candidate.full_name}," if candidate.full_name else "Hi,"
+            ics_content = self._make_ics(
+                organizer_name, sender_email, candidate.full_name or "Candidate",
+                candidate.email, role, slot_time,
+            )
             subject = f"Interview Invitation: {role}"
-            body = f"Hi,\n\nWe are impressed by your profile. Please find the interview invite attached for {slot_time}."
+            body = (
+                f"{greeting}\n\nWe are impressed by your profile. Please find the interview "
+                f"invite attached for {local_slot.strftime('%A %d %B %Y at %H:%M %Z')}."
+            )
             try:
-                self._send_email_with_ics(email_addr, subject, body, ics_content)
-                results.append(f"Sent to {email_addr}")
+                self._send_email_with_ics(candidate.email, subject, body, ics_content, sender_email)
+                candidate.invite_sent_at = timezone.now()
+                candidate.save(update_fields=['invite_sent_at', 'updated_at'])
+                results.append(f"Sent to {candidate.email}")
             except Exception as e:
-                results.append(f"Failed {email_addr}: {e}")
+                results.append(f"Failed {candidate.email}: {e}")
         return results
 
-    def send_outcomes(self, hired_emails):
-        state = self.load_state()
-        role = state.get('role', 'Role')
-        all_candidates = state.get('candidates', [])
+    # --- OUTCOMES ---
+    def send_outcomes(self, campaign, hired_candidate_ids):
+        """Send an offer to every candidate in `hired_candidate_ids` (a set of
+        Candidate pks) and a rejection to every other candidate in `campaign`.
+        """
+        role = campaign.role
         results = []
-        
-        sender_email = "recruiter@example.com"
-        try:
-            profile = self.gmail.users().getProfile(userId='me').execute()
-            sender_email = profile.get('emailAddress', sender_email)
-        except: pass
+        sender_email = self._sender_email()
 
-        for cand in all_candidates:
-            email_addr = cand.get('email')
-            if not email_addr: continue
-            
-            if email_addr in hired_emails:
+        for candidate in campaign.candidates.all():
+            greeting = f"Hi {candidate.full_name}," if candidate.full_name else "Hi,"
+            if candidate.pk in hired_candidate_ids:
                 subject = f"Offer: {role}"
-                body = f"Hi,\n\nCongratulations! We are thrilled to offer you the {role} position.\n\nWelcome aboard!"
-                status = "OFFER_SENT"
+                body = f"{greeting}\n\nCongratulations! We are thrilled to offer you the {role} position.\n\nWelcome aboard!"
+                outcome_type = 'offer'
+                log_status = 'OFFER_SENT'
             else:
                 subject = f"Update on your application for {role}"
-                body = f"Hi,\n\nThank you for your application. We have decided to move forward with other candidates."
-                status = "REJECTED"
+                body = f"{greeting}\n\nThank you for your application. We have decided to move forward with other candidates."
+                outcome_type = 'rejected'
+                log_status = 'REJECTED'
 
             try:
-                self._send_plain_email(email_addr, subject, body)
-                results.append(f"{status}: {email_addr}")
+                self._send_plain_email(candidate.email, subject, body, sender_email)
+                candidate.outcome_type = outcome_type
+                candidate.outcome_sent_at = timezone.now()
+                candidate.save(update_fields=['outcome_type', 'outcome_sent_at', 'updated_at'])
+                results.append(f"{log_status}: {candidate.email}")
             except Exception as e:
-                results.append(f"FAILED: {email_addr} - {e}")
-            
-            self._log_outcome_to_sheet(state.get('sheet_id'), email_addr, status)
+                results.append(f"FAILED: {candidate.email} - {e}")
+
+            if self.has_google and campaign.sheet_id:
+                self._log_outcome_to_sheet(campaign.sheet_id, candidate.email, log_status)
         return results
 
     # --- HELPERS ---
-    def _send_plain_email(self, to_email, subject, body):
-        msg = MIMEMultipart()
-        msg["To"] = to_email
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
-        self.gmail.users().messages().send(userId="me", body={"raw": raw}).execute()
+    def _parse_interview_datetime(self, value):
+        """Parse the <input type="datetime-local"> value into an aware datetime.
+
+        strptime produces a naive datetime, and .astimezone() on a naive value
+        assumes the *server's* timezone. On a UTC container with TIME_ZONE set to
+        Asia/Kolkata that silently shifted every invite by 5.5 hours.
+        """
+        if not value:
+            raise ValueError("An interview date and time is required.")
+        for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                naive = datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+            return timezone.make_aware(naive, timezone.get_current_timezone())
+        raise ValueError(f"Unrecognised interview date/time: {value!r}")
+
+    def _sender_email(self):
+        """The address candidate-facing email goes out from: the connected
+        Google account's own address if there is one, else the app's own
+        configured sender."""
+        if self.has_google:
+            try:
+                profile = self.gmail.users().getProfile(userId='me').execute()
+                addr = profile.get('emailAddress')
+                if addr:
+                    return addr
+            except HttpError as e:
+                logger.warning(f"Could not read Gmail profile, falling back to DEFAULT_FROM_EMAIL: {e}")
+        return settings.DEFAULT_FROM_EMAIL
+
+    def _send_plain_email(self, to_email, subject, body, sender_email):
+        if self.has_google:
+            msg = MIMEMultipart()
+            msg["To"] = to_email
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+            self.gmail.users().messages().send(userId="me", body={"raw": raw}).execute()
+        else:
+            send_mail(subject, body, sender_email, [to_email], fail_silently=False)
+
+    def _send_email_with_ics(self, to_email, subject, body, ics_text, sender_email):
+        if self.has_google:
+            msg = MIMEMultipart("mixed")
+            msg["To"] = to_email
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+            ics_part = MIMEText(ics_text, "calendar", "utf-8")
+            ics_part.add_header("Content-Class", "urn:content-classes:calendarmessage")
+            ics_part.add_header("Content-Type", "text/calendar; method=REQUEST")
+            msg.attach(ics_part)
+            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+            self.gmail.users().messages().send(userId="me", body={"raw": raw}).execute()
+        else:
+            email = EmailMessage(subject, body, sender_email, [to_email])
+            email.attach('invite.ics', ics_text, 'text/calendar; method=REQUEST')
+            email.send(fail_silently=False)
+
+    def _ensure_sheet_tab(self, sheet_id, tab_title, header_row):
+        try:
+            self.sheets.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": tab_title}}}]},
+            ).execute()
+            self.sheets.spreadsheets().values().append(
+                spreadsheetId=sheet_id, range=f"{tab_title}!A1",
+                valueInputOption="RAW", body={"values": [header_row]},
+            ).execute()
+        except HttpError as e:
+            if e.resp.status != 400:   # 400 == tab already exists
+                logger.warning(f"Could not initialise {tab_title!r} tab on {sheet_id}: {e}")
+
+    def _append_candidate_row(self, sheet_id, candidate):
+        row = [[
+            timezone.localtime(candidate.created_at).strftime("%Y-%m-%d %H:%M:%S"),
+            candidate.full_name, candidate.email, candidate.years_experience,
+            candidate.score, candidate.resume_status,
+        ]]
+        try:
+            self.sheets.spreadsheets().values().append(
+                spreadsheetId=sheet_id, range="Applications!A1",
+                valueInputOption="RAW", body={"values": row},
+            ).execute()
+        except HttpError as e:
+            # Best-effort: the application is already saved in the DB regardless.
+            logger.warning(f"Could not append candidate row to sheet {sheet_id}: {e}")
 
     def _log_outcome_to_sheet(self, sheet_id, email, status):
+        self._ensure_sheet_tab(sheet_id, "Outcomes", ["Time", "Email", "Status"])
         try:
-            try: self.sheets.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={"requests": [{"addSheet": {"properties": {"title": "Outcomes"}}}]}).execute()
-            except: pass
-            row = [[datetime.now().strftime("%Y-%m-%d %H:%M:%S"), email, status]]
-            self.sheets.spreadsheets().values().append(spreadsheetId=sheet_id, range="Outcomes!A1", valueInputOption="RAW", body={"values": row}).execute()
-        except: pass
+            row = [[timezone.now().strftime("%Y-%m-%d %H:%M:%S"), email, status]]
+            self.sheets.spreadsheets().values().append(
+                spreadsheetId=sheet_id, range="Outcomes!A1",
+                valueInputOption="RAW", body={"values": row},
+            ).execute()
+        except HttpError as e:
+            # Logging the outcome is best-effort; the email has already been sent
+            # and must not be re-sent just because the Sheet write failed.
+            logger.error(f"Failed to log outcome to sheet {sheet_id}: {e}")
 
-    def _q_text(self, title, idx, paragraph=False, required=True, desc=None):
-        item = {"title": title, "questionItem": {"question": {"required": required, "textQuestion": {"paragraph": paragraph}}}}
-        if desc: item["description"] = desc
-        return {"createItem": {"item": item, "location": {"index": idx}}}
-
-    def _q_radio(self, title, options, idx):
-        opts = [{"value": o} for o in options]
-        item = {"title": title, "questionItem": {"question": {"required": True, "choiceQuestion": {"type": "RADIO", "options": opts}}}}
-        return {"createItem": {"item": item, "location": {"index": idx}}}
-
-    def _get_qid(self, meta, title):
-        for item in meta.get("items", []):
-            if item.get("title") == title: return item["questionItem"]["question"]["questionId"]
-        return None
-
-    def _get_answer(self, resp, qid):
-        if not qid: return None
-        a = resp.get('answers', {}).get(qid, {}).get('textAnswers', {}).get('answers', [])
-        return a[0]['value'] if a else None
-
-    def _extract_file_id(self, url):
-        m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
-        if m: return m.group(1)
+    def _extract_text(self, file_content):
         try:
-            from urllib.parse import urlparse, parse_qs
-            qs = parse_qs(urlparse(url).query)
-            if "id" in qs: return qs["id"][0]
-        except: pass
-        return None 
+            reader = PdfReader(io.BytesIO(file_content))
+            return "\n".join((p.extract_text() or "") for p in reader.pages)
+        except Exception as e:
+            # pypdf raises a wide range of types on malformed input, and this
+            # parses untrusted applicant-supplied PDFs.
+            logger.warning(f"Could not extract text from resume: {e}")
+            return ""
 
-    def _download_file(self, file_id, path):
-        try:
-            req = self.drive.files().get_media(fileId=file_id)
-            with io.FileIO(path, "wb") as fh:
-                downloader = MediaIoBaseDownload(fh, req)
-                done = False
-                while not done: status, done = downloader.next_chunk()
-        except: pass
+    def _score_resume(self, text, keywords):
+        """Word-boundary match against `keywords`, normalised to 0-100.
 
-    def _extract_text(self, path):
-        try: return "\n".join([p.extract_text() for p in PdfReader(path).pages])
-        except: return ""
-
-    def _score_text(self, text):
-        keywords = ["python", "django", "api", "sql", "rest", "docker", "java", "node", "aws"]
-        return sum(1 for k in keywords if k in text.lower())
+        The old substring check (`"java" in text`) matched "javascript" and
+        `"api" in text` matched "therapist" — both real false positives.
+        `\\b` boundaries fix that; re.escape handles multi-word keywords like
+        "machine learning" safely.
+        """
+        if not keywords:
+            return 0, []
+        lowered = text.lower()
+        matched = [
+            k for k in keywords
+            if re.search(rf"\b{re.escape(k.lower())}\b", lowered)
+        ]
+        score = round(100 * len(matched) / len(keywords))
+        return score, matched
 
     def _make_ics(self, org_name, sender_email, cand_name, cand_email, role, start_dt):
         uid = f"{uuid.uuid4().hex}@hiring-agent"
         end_dt = start_dt + timedelta(minutes=45)
-        fmt = lambda d: d.astimezone(tz.UTC).strftime("%Y%m%dT%H%M%SZ")
+
+        def fmt(d):
+            if timezone.is_naive(d):
+                d = timezone.make_aware(d, timezone.get_current_timezone())
+            return d.astimezone(tz.UTC).strftime("%Y%m%dT%H%M%SZ")
+
         return f"""BEGIN:VCALENDAR
 PRODID:-//HiringAgent//EN
 VERSION:2.0
 METHOD:REQUEST
 BEGIN:VEVENT
 UID:{uid}
-DTSTAMP:{fmt(datetime.now())}
+DTSTAMP:{fmt(timezone.now())}
 DTSTART:{fmt(start_dt)}
 DTEND:{fmt(end_dt)}
 SUMMARY:Interview: {role}
 ORGANIZER;CN={org_name}:mailto:{sender_email}
-ATTENDEE;ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:{cand_email}
+ATTENDEE;ROLE=REQ-PARTICIPANT;RSVP=TRUE;CN={cand_name}:mailto:{cand_email}
 DESCRIPTION:Interview for {role}
 END:VEVENT
 END:VCALENDAR"""
 
-    def _send_email_with_ics(self, to_email, subject, body, ics_text):
-        msg = MIMEMultipart("mixed") 
-        msg["To"] = to_email
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-        ics_part = MIMEText(ics_text, "calendar", "utf-8")
-        ics_part.add_header("Content-Class", "urn:content-classes:calendarmessage")
-        ics_part.add_header("Content-Type", "text/calendar; method=REQUEST")
-        msg.attach(ics_part)
-        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
-        self.gmail.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+def _parse_keyword_response(raw_text):
+    """Best-effort parse of Gemini's keyword-list response into a clean list
+    of lowercase strings. Gemini sometimes wraps JSON in a ```json fence
+    despite being asked not to — strip that before parsing."""
+    text = raw_text.strip()
+    if text.startswith('```'):
+        text = re.sub(r'^```[a-zA-Z]*\n?', '', text)
+        text = re.sub(r'```$', '', text).strip()
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    keywords = [str(k).strip().lower() for k in data if str(k).strip()]
+    return keywords[:20]  # sanity cap — a runaway response shouldn't balloon scoring cost

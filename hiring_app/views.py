@@ -1,28 +1,30 @@
-import os
 import json
 import logging
 
-from django.shortcuts import render, redirect
-from django.contrib.auth import authenticate, login
-from django.contrib.auth.forms import AuthenticationForm
+import requests
+
+from django.http import FileResponse, Http404
+from django.shortcuts import render, redirect, get_object_or_404
+from django.urls import reverse
+from django.conf import settings
+from django.contrib import messages
+from django.contrib.auth import login
+from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
-from django.conf import settings
-from django.http import HttpResponseServerError
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
+from django.http import JsonResponse
+from django.views.decorators.http import require_POST, require_http_methods
 from django_ratelimit.decorators import ratelimit
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
 from google_auth_oauthlib.flow import Flow
 
-from .services import HiringAutomator, SCOPES
-from .models import GoogleOAuthToken
-from .campaign_manager import (
-    load_index, get_campaign_meta, upsert_campaign_meta,
-    sync_index_from_state, campaign_state_path,
-    get_active_campaign_id, set_active_campaign_id,
-    create_new_campaign, ensure_active_campaign,
-)
+from .services import HiringAutomator, SCOPES, JDGenerationFailed
+from .models import GoogleOAuthToken, Campaign, Candidate
+from .forms import ApplicationForm
 
 logger = logging.getLogger('hiring_app')
 
@@ -38,9 +40,10 @@ def _build_oauth_flow(request, state=None, code_verifier=None):
     session) so it matches the PKCE code_challenge sent on the initial
     authorization request — google-auth-oauthlib auto-generates a fresh
     code_verifier per Flow instance otherwise, and since the callback builds
-    a separate Flow object from the one that started the flow, the token
+    a separate Flow object than the one that started the flow, the token
     exchange would be missing it (Google error: "Missing code verifier").
     """
+    import os
     redirect_uri = request.build_absolute_uri('/google/oauth2callback/')
     client_secrets_json = getattr(settings, 'GOOGLE_CLIENT_SECRETS', '')
 
@@ -60,7 +63,9 @@ def _build_oauth_flow(request, state=None, code_verifier=None):
 def _get_user_google_creds(user):
     """
     Load & auto-refresh Google OAuth credentials for a user from DB.
-    Returns Credentials object or None (falls back to token.json in HiringAutomator).
+    Returns a Credentials object, or None if the user hasn't connected Google
+    (or refresh failed) — HiringAutomator then raises GoogleNotConnected on
+    any Google-backed operation. There is no fallback to a shared token.
     """
     try:
         token_record = GoogleOAuthToken.objects.get(user=user)
@@ -73,38 +78,39 @@ def _get_user_google_creds(user):
                 creds.refresh(GoogleRequest())
                 token_record.token_json = creds.to_json()
                 token_record.save()
-                logger.info(f"Refreshed Google token for user {user.username}")
+                logger.info(f"Refreshed Google token for user id={user.id}")
             except Exception as e:
-                logger.error(f"Failed to refresh Google token for {user.username}: {e}")
+                logger.error(f"Failed to refresh Google token for user id={user.id}: {e}")
                 return None
         return creds
     except GoogleOAuthToken.DoesNotExist:
-        return None  # HiringAutomator will fall back to token.json
+        return None
     except Exception as e:
-        logger.error(f"Error loading Google creds for {user.username}: {e}")
+        logger.error(f"Error loading Google creds for user id={user.id}: {e}")
         return None
 
 
-def _get_automator_for_active(request):
-    """Build HiringAutomator for the active campaign, injecting per-user Google creds."""
-    campaign_id, state_path = ensure_active_campaign(request)
-    token_path = os.path.join(settings.BASE_DIR, 'token.json')
-    creds = _get_user_google_creds(request.user)
-    automator = HiringAutomator(token_path=token_path, state_path=state_path, creds=creds)
-    return automator, campaign_id
+def _automator_for(request):
+    return HiringAutomator(creds=_get_user_google_creds(request.user))
 
 
-def _agent_context(request, campaign_id, state, extra=None):
+def _get_owned_campaign(request, campaign_id):
+    """Ownership is a database constraint, not a filesystem path convention:
+    a campaign_id belonging to another user 404s here rather than ever being
+    reachable."""
+    return get_object_or_404(Campaign, pk=campaign_id, owner=request.user)
+
+
+def _agent_context(request, campaign, extra=None):
     """Build the full context dict for agent.html."""
-    all_campaigns = load_index(request.user.id)
     ctx = {
-        'state':              state,
-        'candidates':         state.get('candidates', []),
-        'campaign_id':        campaign_id,
-        'campaign_meta':      get_campaign_meta(request.user.id, campaign_id),
-        'history':            [c for c in all_campaigns if c['id'] != campaign_id],
-        'current_role':       state.get('role', ''),
-        'has_google':         GoogleOAuthToken.objects.filter(user=request.user).exists(),
+        'campaign':      campaign,
+        'campaign_id':   campaign.pk,
+        'apply_url':     request.build_absolute_uri(reverse('apply', args=[campaign.public_token])),
+        'candidates':    campaign.candidates.all(),
+        'history':       Campaign.objects.filter(owner=request.user).exclude(pk=campaign.pk),
+        'current_role':  campaign.role,
+        'has_google':    GoogleOAuthToken.objects.filter(user=request.user).exists(),
     }
     if extra:
         ctx.update(extra)
@@ -138,32 +144,80 @@ def login_view(request):
 
 @ratelimit(key='ip', rate='5/m', method='POST', block=True)
 def register_view(request):
+    """Registration.
+
+    Uses UserCreationForm so Django's configured AUTH_PASSWORD_VALIDATORS
+    actually run. The previous hand-rolled checks only enforced a length of 8,
+    which meant 'password123' and '12345678' were both accepted.
+    """
     if request.user.is_authenticated:
         return redirect('dashboard')
+
     error = None
     if request.method == 'POST':
-        username  = request.POST.get('username', '').strip()
-        email     = request.POST.get('email', '').strip()
-        password1 = request.POST.get('password1', '')
-        password2 = request.POST.get('password2', '')
+        form = UserCreationForm(request.POST)
+        email = request.POST.get('email', '').strip()
 
-        if not username or not email or not password1:
-            error = "All fields are required."
-        elif password1 != password2:
-            error = "Passwords do not match."
-        elif len(password1) < 8:
-            error = "Password must be at least 8 characters."
-        elif User.objects.filter(username=username).exists():
-            error = "Username already taken."
-        elif User.objects.filter(email=email).exists():
+        try:
+            validate_email(email)
+            email_ok = True
+        except ValidationError:
+            email_ok = False
+
+        if not email_ok:
+            error = "Enter a valid email address."
+        elif User.objects.filter(email__iexact=email).exists():
             error = "Email already registered."
-        else:
-            user = User.objects.create_user(username=username, email=email, password=password1)
+        elif form.is_valid():
+            user = form.save(commit=False)
+            user.email = email
+            user.save()
             login(request, user)
-            logger.info(f"New user registered: {username}")
+            logger.info(f"New user registered: id={user.id}")
             return redirect('dashboard')
+        else:
+            error = ' '.join(
+                msg for msgs in form.errors.values() for msg in msgs
+            )
 
     return render(request, 'hiring_app/register.html', {'error': error})
+
+
+# ─────────────────────────────────────────────────────────────
+# PUBLIC — Apply Page
+#
+# This is what replaced the Google Form as of Phase 2: an applicant needs no
+# account, and the recruiter needs no Google connection, for an application to
+# go through. `public_token` alone is the access control — it's unguessable
+# (see models._generate_public_token) and doesn't reveal the campaign's
+# internal UUID.
+# ─────────────────────────────────────────────────────────────
+
+@ratelimit(key='ip', rate='10/h', method='POST', block=True)
+def apply(request, public_token):
+    campaign = get_object_or_404(Campaign, public_token=public_token)
+
+    if not campaign.accepting_applications:
+        return render(request, 'hiring_app/apply_closed.html', {'campaign': campaign})
+
+    if request.method == 'POST':
+        form = ApplicationForm(request.POST, request.FILES)
+        if form.is_valid():
+            automator = HiringAutomator(creds=_get_user_google_creds(campaign.owner))
+            try:
+                automator.process_application(campaign, form.cleaned_data)
+                logger.info(f"New application to campaign={campaign.pk}")
+                return render(request, 'hiring_app/apply_success.html', {'campaign': campaign})
+            except Exception:
+                logger.exception(f"Application processing failed for campaign={campaign.pk}")
+                messages.error(
+                    request,
+                    "Something went wrong processing your application. Please try again.",
+                )
+    else:
+        form = ApplicationForm()
+
+    return render(request, 'hiring_app/apply.html', {'campaign': campaign, 'form': form})
 
 
 # ─────────────────────────────────────────────────────────────
@@ -189,10 +243,11 @@ def google_connect(request):
             'error': 'Google OAuth is not configured yet. Please contact the administrator.',
             'has_google': False,
         })
-    except Exception as e:
-        logger.error(f"Google OAuth start failed: {e}")
+    except Exception:
+        # Do not render {e}: it can leak client IDs, token endpoints, and paths.
+        logger.exception("Google OAuth start failed")
         return render(request, 'hiring_app/google_connect.html', {
-            'error': f'Could not start Google sign-in: {e}',
+            'error': 'Could not start Google sign-in. Please try again.',
             'has_google': False,
         })
 
@@ -215,21 +270,48 @@ def google_oauth_callback(request):
         request.session.pop('google_oauth_code_verifier', None)
         logger.info(f"Google account connected for user: {request.user.username}")
         return redirect('agent')
-    except Exception as e:
-        logger.error(f"Google OAuth callback failed for {request.user.username}: {e}")
+    except Exception:
+        logger.exception(f"Google OAuth callback failed for user id={request.user.id}")
         return render(request, 'hiring_app/google_connect.html', {
-            'error': f'Google sign-in failed: {e}. Please try again.',
+            'error': 'Google sign-in failed. Please try connecting again.',
             'has_google': False,
         })
 
 
 @login_required
+@require_POST
 def google_disconnect(request):
-    """Remove stored Google token for the user."""
-    if request.method == 'POST':
-        GoogleOAuthToken.objects.filter(user=request.user).delete()
-        logger.info(f"Google account disconnected for user: {request.user.username}")
+    """Remove the stored Google token and revoke the grant with Google."""
+    token_record = GoogleOAuthToken.objects.filter(user=request.user).first()
+    if token_record:
+        _revoke_google_token(token_record)
+        token_record.delete()
+        logger.info(f"Google account disconnected for user id={request.user.id}")
+        messages.success(request, "Your Google account has been disconnected.")
     return redirect('dashboard')
+
+
+def _revoke_google_token(token_record):
+    """Best-effort revoke at Google's end.
+
+    Deleting our row alone leaves the grant live on the user's Google account,
+    so the app would still appear under myaccount.google.com/permissions.
+    """
+    try:
+        data = json.loads(token_record.token_json)
+        token = data.get('refresh_token') or data.get('token')
+        if not token:
+            return
+        resp = requests.post(
+            'https://oauth2.googleapis.com/revoke',
+            params={'token': token},
+            headers={'content-type': 'application/x-www-form-urlencoded'},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"Google token revoke returned HTTP {resp.status_code}")
+    except (json.JSONDecodeError, requests.RequestException) as e:
+        logger.warning(f"Could not revoke Google token: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -239,14 +321,14 @@ def google_disconnect(request):
 @login_required
 def dashboard_overview(request):
     user = request.user
-    index = load_index(user.id)
+    campaigns = Campaign.objects.filter(owner=user)
 
-    total_candidates = sum(c.get('candidates_count', 0) for c in index)
-    active_campaigns = len([c for c in index if c.get('status') == 'active'])
+    total_candidates = sum(c.candidates_count for c in campaigns)
+    active_campaigns = campaigns.filter(status='active').count()
 
     context = {
-        'campaigns':        index,
-        'total_campaigns':  len([c for c in index if c.get('status') != 'draft']),
+        'campaigns':        campaigns,
+        'total_campaigns':  campaigns.exclude(status='draft').count(),
         'active_campaigns': active_campaigns,
         'total_candidates': total_candidates,
         'has_google':       GoogleOAuthToken.objects.filter(user=user).exists(),
@@ -259,147 +341,251 @@ def dashboard_overview(request):
 # ─────────────────────────────────────────────────────────────
 
 @login_required
+@require_POST
 def new_campaign(request):
-    create_new_campaign(request)
-    return redirect('agent')
+    campaign = Campaign.objects.create(owner=request.user)
+    return redirect('campaign_agent', campaign_id=campaign.pk)
 
-
-@login_required
-def switch_campaign(request, campaign_id):
-    if get_campaign_meta(request.user.id, campaign_id):
-        set_active_campaign_id(request, campaign_id)
-    return redirect('agent')
-
-
-# ─────────────────────────────────────────────────────────────
-# PROTECTED — Agent Page
-# ─────────────────────────────────────────────────────────────
 
 @login_required
 def agent(request):
-    campaign_id, state_path = ensure_active_campaign(request)
-    token_path = os.path.join(settings.BASE_DIR, 'token.json')
-    creds = _get_user_google_creds(request.user)
-    automator = HiringAutomator(token_path=token_path, state_path=state_path, creds=creds)
+    """Convenience redirect: resolves to a specific campaign's workspace.
 
-    try:
-        state = automator.load_state()
-    except Exception as e:
-        logger.error(f"Failed to load campaign state for user {request.user.username}: {e}")
-        state = {}
+    Prefers the most recently created non-draft campaign, then the most
+    recent draft, and only creates a new one if the user has none at all —
+    unlike the old session-based version, this no longer manufactures a fresh
+    "New Campaign" draft every time it can't find a non-draft one, which is
+    what let empty drafts accumulate without bound.
+    """
+    campaigns = Campaign.objects.filter(owner=request.user)
+    campaign = campaigns.exclude(status='draft').first() or campaigns.first()
+    if not campaign:
+        campaign = Campaign.objects.create(owner=request.user)
+    return redirect('campaign_agent', campaign_id=campaign.pk)
 
-    return render(request, 'hiring_app/agent.html', _agent_context(request, campaign_id, state))
+
+@login_required
+def campaign_agent(request, campaign_id):
+    campaign = _get_owned_campaign(request, campaign_id)
+    return render(request, 'hiring_app/agent.html', _agent_context(request, campaign))
+
+
+@login_required
+def view_resume(request, campaign_id, candidate_id):
+    """Serve a candidate's resume PDF.
+
+    Resumes are stored on STORAGES['default'] (local disk today, see
+    models.candidate_resume_path) with no public URL — this is the only way
+    to reach one, and it's ownership-checked the same way every campaign view
+    is. Without this, resumes uploaded through the Phase 2 apply page would be
+    write-only: saved, scored, and then unreachable through the UI forever.
+    """
+    campaign = _get_owned_campaign(request, campaign_id)
+    candidate = get_object_or_404(Candidate, pk=candidate_id, campaign=campaign)
+    if not candidate.resume:
+        raise Http404("No resume on file for this candidate.")
+    filename = f"{candidate.full_name or candidate.email}.pdf".replace('/', '-')
+    return FileResponse(candidate.resume.open('rb'), filename=filename, content_type='application/pdf')
 
 
 # ─────────────────────────────────────────────────────────────
 # PROTECTED — Agent Actions
 # ─────────────────────────────────────────────────────────────
 
-@login_required
-def generate_jd(request):
-    if request.method != 'POST':
-        return redirect('agent')
+def _validate_recipients(campaign, submitted):
+    """Match submitted email strings to this campaign's own Candidate rows.
 
+    Without this the POSTed list went straight to the Gmail API, so any
+    authenticated user could send mail to arbitrary addresses from the
+    connected Google account — an authenticated spam relay.
+    """
+    allowed = {c.email.strip().lower(): c for c in campaign.candidates.all()}
+    valid, rejected = [], []
+    for raw in submitted:
+        addr = (raw or '').strip()
+        candidate = allowed.get(addr.lower())
+        if candidate:
+            valid.append(candidate)
+        else:
+            rejected.append(addr)
+    return valid, rejected
+
+
+@login_required
+@require_POST
+@ratelimit(key='user', rate='10/h', method='POST', block=True)
+def generate_jd(request, campaign_id):
+    campaign = _get_owned_campaign(request, campaign_id)
     role       = request.POST.get('role', '').strip()
     experience = request.POST.get('experience', '').strip()
 
-    automator, campaign_id = _get_automator_for_active(request)
+    if not role:
+        messages.error(request, "Enter a role title before generating a JD.")
+        return redirect('campaign_agent', campaign_id=campaign.pk)
 
+    automator = _automator_for(request)
     try:
         jd = automator.generate_jd(role, experience)
-    except Exception as e:
-        logger.error(f"JD generation failed: {e}")
-        jd = f"# {role}\n\n(AI generation failed. Please write the JD manually.)"
+    except JDGenerationFailed:
+        messages.error(
+            request,
+            "The AI could not draft a job description right now. "
+            "You can write one manually and continue.",
+        )
+        jd = ''
 
-    upsert_campaign_meta(request.user.id, campaign_id, role=role, status='draft')
+    campaign.role = role
+    campaign.experience = experience
+    campaign.save(update_fields=['role', 'experience', 'updated_at'])
 
-    state = automator.load_state()
-    ctx = _agent_context(request, campaign_id, state, {
+    ctx = _agent_context(request, campaign, {
         'jd_preview':   jd,
         'role_preview': role,
         'exp_preview':  experience,
-        'current_role': role,
     })
     return render(request, 'hiring_app/agent.html', ctx)
 
 
 @login_required
-def create_campaign(request):
-    if request.method != 'POST':
-        return redirect('agent')
+@require_POST
+@ratelimit(key='user', rate='10/h', method='POST', block=True)
+def create_campaign(request, campaign_id):
+    """Launch the campaign: store the JD, derive scoring keywords, go live.
 
-    role           = request.POST.get('role', '').strip()
-    jd             = request.POST.get('jd_text', '')
-    linkedin_token = request.POST.get('linkedin_token', '').strip() or None
-    linkedin_urn   = request.POST.get('linkedin_urn', '').strip() or None
+    Google is optional — HiringAutomator.create_campaign only touches Sheets,
+    best-effort, if the recruiter has connected an account. There's no more
+    Forms/Drive step, so there's nothing here that hard-requires Google.
+    """
+    campaign = _get_owned_campaign(request, campaign_id)
+    role = request.POST.get('role', '').strip()
+    jd   = request.POST.get('jd_text', '')
 
-    automator, campaign_id = _get_automator_for_active(request)
+    if not role:
+        messages.error(request, "Enter a role title before launching a campaign.")
+        return redirect('campaign_agent', campaign_id=campaign.pk)
+
+    campaign.role = role
+    automator = _automator_for(request)
 
     try:
-        form_url, sheet_url = automator.create_campaign(role, jd, linkedin_token, linkedin_urn)
-        upsert_campaign_meta(
-            request.user.id, campaign_id,
-            role=role, status='active',
-            form_url=form_url, sheet_url=sheet_url, candidates_count=0,
+        automator.create_campaign(campaign, jd)
+        logger.info(f"Campaign launched: campaign={campaign.pk} by user id={request.user.id}")
+        messages.success(request, f"Campaign for “{role}” is live — share the apply link with candidates.")
+    except Exception:
+        logger.exception(f"Campaign creation failed for user id={request.user.id}")
+        messages.error(request, "Could not launch the campaign. Please try again.")
+
+    return redirect('campaign_agent', campaign_id=campaign.pk)
+
+
+@login_required
+@require_POST
+def send_invites(request, campaign_id):
+    campaign = _get_owned_campaign(request, campaign_id)
+    submitted      = request.POST.getlist('selected_candidates')
+    interview_date = request.POST.get('interview_date')
+
+    if not submitted:
+        messages.error(request, "Select at least one candidate to invite.")
+        return redirect('campaign_agent', campaign_id=campaign.pk)
+
+    selected, rejected = _validate_recipients(campaign, submitted)
+    if rejected:
+        logger.warning(
+            f"Rejected {len(rejected)} invite recipient(s) not in campaign, "
+            f"user id={request.user.id}"
         )
-        logger.info(f"Campaign launched: {role} by {request.user.username}")
-    except Exception as e:
-        logger.error(f"Campaign creation failed for {request.user.username}: {e}")
+    if not selected:
+        messages.error(request, "None of the selected candidates belong to this campaign.")
+        return redirect('campaign_agent', campaign_id=campaign.pk)
 
-    return redirect('agent')
+    automator = _automator_for(request)
+    try:
+        results = automator.send_invites(campaign, selected, "Hiring Team", interview_date)
+        failures = [r for r in results if r.startswith('Failed')]
+        logger.info(
+            f"Invites: {len(results) - len(failures)} sent, {len(failures)} failed, "
+            f"user id={request.user.id}"
+        )
+        if failures:
+            messages.warning(
+                request,
+                f"Sent {len(results) - len(failures)} invite(s); {len(failures)} could not be delivered.",
+            )
+        else:
+            messages.success(request, f"Sent {len(results)} interview invite(s).")
+    except ValueError as e:
+        messages.error(request, str(e))
+    except Exception:
+        logger.exception(f"Send invites failed for user id={request.user.id}")
+        messages.error(request, "Could not send the invites. Please try again.")
+
+    return redirect('campaign_agent', campaign_id=campaign.pk)
 
 
 @login_required
-def sync_responses(request):
-    automator, campaign_id = _get_automator_for_active(request)
+@require_POST
+def send_outcomes(request, campaign_id):
+    """Send offers to the selected candidates and rejections to everyone else.
+
+    This is irreversible, so it requires an explicit confirmation token from the
+    interstitial rather than firing on a single click.
+    """
+    campaign = _get_owned_campaign(request, campaign_id)
+    submitted = request.POST.getlist('hired_candidates')
+    hired, rejected = _validate_recipients(campaign, submitted)
+
+    if rejected:
+        logger.warning(
+            f"Rejected {len(rejected)} outcome recipient(s) not in campaign, "
+            f"user id={request.user.id}"
+        )
+        messages.error(request, "Some selected candidates do not belong to this campaign.")
+        return redirect('campaign_agent', campaign_id=campaign.pk)
+
+    total = campaign.candidates.count()
+    if not total:
+        messages.error(request, "There are no candidates to send outcomes to.")
+        return redirect('campaign_agent', campaign_id=campaign.pk)
+
+    if request.POST.get('confirm') != 'SEND':
+        return render(request, 'hiring_app/confirm_outcomes.html', {
+            'campaign_id':  campaign.pk,
+            'hired_emails': [c.email for c in hired],
+            'offer_count':  len(hired),
+            'reject_count': total - len(hired),
+            'total_count':  total,
+        })
+
+    automator = _automator_for(request)
     try:
-        automator.sync_responses()
-        sync_index_from_state(request.user.id, campaign_id)
-        logger.info(f"Sync completed for campaign {campaign_id}")
-    except Exception as e:
-        logger.error(f"Sync failed for {request.user.username}: {e}")
-    return redirect('agent')
+        hired_ids = {c.pk for c in hired}
+        results = automator.send_outcomes(campaign, hired_ids)
+        campaign.status = 'completed'
+        campaign.save(update_fields=['status', 'updated_at'])
+        failures = [r for r in results if r.startswith('FAILED')]
+        logger.info(
+            f"Outcomes: {len(results) - len(failures)} sent, {len(failures)} failed, "
+            f"campaign={campaign.pk}, user id={request.user.id}"
+        )
+        if failures:
+            messages.warning(
+                request,
+                f"Sent {len(results) - len(failures)} outcome email(s); {len(failures)} failed.",
+            )
+        else:
+            messages.success(request, f"Sent {len(results)} outcome email(s).")
+    except Exception:
+        logger.exception(f"Send outcomes failed for user id={request.user.id}")
+        messages.error(request, "Could not send the outcome emails. Please try again.")
+
+    return redirect('campaign_agent', campaign_id=campaign.pk)
 
 
-@login_required
-def send_invites(request):
-    if request.method != 'POST':
-        return redirect('agent')
+# ─────────────────────────────────────────────────────────────
+# Health check (platform readiness probe)
+# ─────────────────────────────────────────────────────────────
 
-    selected_emails = request.POST.getlist('selected_candidates')
-    interview_date  = request.POST.get('interview_date')
-
-    if not selected_emails:
-        return redirect('agent')
-
-    automator, _ = _get_automator_for_active(request)
-    try:
-        results = automator.send_invites(selected_emails, "Hiring Team", interview_date)
-        logger.info(f"Invites sent to {selected_emails} by {request.user.username}")
-        for r in results:
-            logger.info(r)
-    except Exception as e:
-        logger.error(f"Send invites failed: {e}")
-
-    return redirect('agent')
-
-
-@login_required
-def send_outcomes(request):
-    if request.method != 'POST':
-        return redirect('agent')
-
-    hired_emails = request.POST.getlist('hired_candidates')
-    automator, campaign_id = _get_automator_for_active(request)
-
-    try:
-        results = automator.send_outcomes(hired_emails)
-        upsert_campaign_meta(request.user.id, campaign_id, status='completed')
-        sync_index_from_state(request.user.id, campaign_id)
-        logger.info(f"Outcomes sent by {request.user.username}: hired={hired_emails}")
-        for r in results:
-            logger.info(r)
-    except Exception as e:
-        logger.error(f"Send outcomes failed: {e}")
-
-    return redirect('agent')
+@require_http_methods(['GET', 'HEAD'])
+def healthz(request):
+    return JsonResponse({'status': 'ok'})

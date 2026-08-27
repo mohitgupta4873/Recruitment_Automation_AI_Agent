@@ -1,21 +1,18 @@
 Recruitment Automation AI Agent 🤖
 
-A full-stack application that automates the end-to-end hiring lifecycle. This agent leverages Google Gemini AI for intelligence and the Google Workspace Ecosystem (Drive, Forms, Sheets, Gmail, Calendar) for backend operations, creating a seamless experience for recruiters.
+A full-stack Django application that automates the end-to-end hiring lifecycle: draft a job description with Google Gemini, launch a campaign with its own public application page, let candidates apply directly with a resume upload, score them automatically against AI-derived keywords for the role, schedule interviews, and send offer/rejection outcomes — all from one dashboard. Google (Sheets export, Gmail send) is entirely optional; everything works without it.
 
 📸 Dashboard Preview
 
 <img width="2770" height="1062" alt="Screenshot 2025-11-29 155736" src="https://github.com/user-attachments/assets/97a176d7-70c4-4402-a3f0-7d50d2ecfa74" />
 
-
 Figure 1: AI Job Description Generation and Campaign Launch
 
 <img width="2745" height="1388" alt="Screenshot 2025-11-29 155742" src="https://github.com/user-attachments/assets/db1840c8-d9c9-4d91-a51e-3f5925f58a18" />
 
-Figure 2: Candidate Scoring, Syncing, and Interview Scheduling
+Figure 2: Candidate scoring and interview scheduling (screenshots predate the move to a self-hosted apply page — the core dashboard layout is unchanged)
 
 🔄 The Full Automation Flow
-
-This application replaces manual hiring tasks with a streamlined 5-step workflow:
 
 1. Smart JD Drafting ✍️
 
@@ -27,119 +24,109 @@ Edit: The recruiter can tweak the JD before finalizing.
 
 2. Campaign Launch 🚀
 
-One-Click Deployment: The app automatically interacts with Google APIs to:
+One-Click Deployment: Launching a campaign generates a public application link (`/apply/<token>/`) hosted by the app itself — no Google Form involved. If the recruiter has connected Google, a tracking Sheet is also created automatically (optional).
 
-Create a dedicated Google Sheet for tracking.
+Scoring setup: Gemini reads the final JD and derives a short list of role-relevant skills/keywords, used to score every applicant automatically.
 
-Create a Google Form pre-filled with the JD and resume upload fields.
+Result: A live link to share with candidates immediately.
 
-(Optional) Post the opening directly to LinkedIn with the form link.
+3. Applications & AI Scoring 🧠
 
-Result: You get a live link to share with candidates immediately.
+Direct upload: Candidates apply on the app's own page — name, experience, a short pitch, and a resume PDF (validated for type and size).
 
-3. Sync & AI Scoring 🧠
+AI Analysis: The resume is parsed and scored against the role's derived keywords, with the matched skills shown alongside the score — not just a raw number.
 
-Data Aggregation: When candidates apply, the app pulls responses from Google Forms.
-
-Resume Parsing: It automatically downloads PDF resumes from Google Drive.
-
-AI Analysis: The system reads the PDF text and scores the candidate based on keyword matching and relevance to the role.
-
-Display: Candidates appear in the dashboard with their email, AI score, and a resume preview.
+Display: Candidates appear on the dashboard immediately as they apply, with their score, matched skills, and a link to their resume.
 
 4. Automated Scheduling 📅
 
 Selection: The recruiter selects promising candidates via checkboxes.
 
-Action: The app sends personalized Google Calendar invites (ICS files) via Gmail to the selected candidates for the specified interview time.
+Action: The app sends personalized calendar invites (`.ics` files) for the specified interview time — via Gmail if Google is connected, or the app's own email sender otherwise.
 
 5. Final Outcomes ⚖️
 
-Decision: After interviews, the recruiter selects candidates to HIRE.
+Decision: After interviews, the recruiter selects candidates to hire. This step requires typing a confirmation, since it emails every candidate and can't be undone.
 
-Bulk Processing:
+Bulk Processing: Selected candidates receive an offer email; everyone else receives a polite rejection.
 
-Selected: Receive an automated "Offer/Next Steps" email.
-
-Unselected: Receive a polite "Rejection" email.
-
-Logging: All decisions are permanently logged in a specific "Outcomes" tab in the Google Sheet.
+Logging: If a tracking Sheet exists, outcomes are logged to its "Outcomes" tab.
 
 🛠️ Tech Stack
 
 Backend: Django (Python)
 
-AI Model: Google Gemini 1.5 Flash Lite
+Database: PostgreSQL in production (SQLite for local dev)
 
-Database: Google Sheets (acting as the persistent data layer)
+AI Model: Google Gemini (`gemini-2.5-flash-lite`) — JD drafting and scoring-keyword extraction
 
-File Storage: Google Drive (for Resumes)
+Auth: Django's own accounts (username/password, password reset via email) — Google is a separate, optional per-user connection
 
-Authentication: OAuth 2.0 (Google Cloud Platform)
+Optional Google integration: Sheets API (campaign export) and Gmail API (sending as the recruiter), via per-user OAuth 2.0 — encrypted at rest, never required to use the app
 
-APIs Used:
-
-Gmail API
-
-Google Calendar API
-
-Google Drive API
-
-Google Sheets API
-
-Google Forms API
-
-LinkedIn API
+Rate limiting: `django-ratelimit`, backed by Redis in production
 
 ⚙️ Installation & Setup
 
-1. Clone the Repository
+1. Clone the repository
 
-git clone [https://github.com/mohitgupta4873/Recruitment_Automation_AI_Agent.git](https://github.com/mohitgupta4873/Recruitment_Automation_AI_Agent.git)
+```bash
+git clone https://github.com/mohitgupta4873/Recruitment_Automation_AI_Agent.git
 cd Recruitment_Automation_AI_Agent
+```
 
+2. Set up a virtual environment
 
-2. Set up Virtual Environment
-
-python -m venv venv
+```bash
+python -m venv .venv
 # Windows
-.\venv\Scripts\activate
+.\.venv\Scripts\activate
 # Mac/Linux
-source venv/bin/activate
+source .venv/bin/activate
+```
 
+3. Install dependencies
 
-3. Install Dependencies
-
+```bash
 pip install -r requirements.txt
+```
 
+4. Configure environment variables
 
-4. Environment Variables
+```bash
+cp .env.example .env
+```
 
-Create a .env file in the root directory and add your Google Gemini API Key:
+At minimum, set `SECRET_KEY` and `GEMINI_API_KEY` in `.env`. Everything else has a sane local-dev default — see the comments in `.env.example` for what's required outside of `DEBUG=True` (a `REDIS_URL` and a `FIELD_ENCRYPTION_KEY` are both mandatory in production).
 
-GEMINI_API_KEY=your_api_key_here
+5. Run migrations and start the server
 
-
-5. Google OAuth Setup
-
-Download your OAuth 2.0 Client Credentials (client_secrets.json) from Google Cloud Console.
-
-Place the file in the root directory.
-
-Run the token generator script to authenticate locally:
-
-python generate_token.py
-
-
-Follow the browser prompt to allow access. This creates a token.json file.
-
-6. Run the Server
-
+```bash
+python manage.py migrate
 python manage.py runserver
+```
 
+Visit http://127.0.0.1:8000/, register an account, and start a campaign. Connecting Google is optional and can be done later from the dashboard ("Connect Google") — it unlocks Sheets export and sending email as your own Gmail address instead of the app's default sender.
 
-Visit http://127.0.0.1:8000/ to start hiring!
+6. (Optional) Google OAuth for local development
 
-🔒 Security Note
+If you want to test the Google integration locally: download OAuth 2.0 Client credentials from Google Cloud Console as `client_secrets.json` and place it in the repo root (this is read automatically when `GOOGLE_CLIENT_SECRETS` isn't set in `.env`). No separate token-generation script is needed — connecting happens through the app's own "Connect Google" button, per user.
 
-This project uses a .gitignore file to ensure sensitive credentials (token.json, client_secrets.json, .env) and candidate data (cv_pdfs/) are never uploaded to GitHub.
+🔒 Security
+
+- Secrets (`SECRET_KEY`, API keys, `client_secrets.json`, `.env`, the local SQLite DB) are never committed — see `.gitignore`.
+- Each user's Google OAuth token is encrypted at rest and scoped to that user only; there is no shared fallback credential.
+- Passwords are validated against Django's standard strength rules; sessions/CSRF use Django's built-in protections throughout.
+- Resume uploads are validated for file type (PDF magic bytes, not just the extension) and capped in size before being parsed.
+- State-changing actions require POST and, for irreversible bulk actions (sending offers/rejections to an entire candidate pool), a typed confirmation.
+- Rate limiting is enforced on login, registration, and the public application page.
+
+🧪 Tests
+
+```bash
+python manage.py test
+```
+
+📍 Status
+
+This app has been through several rounds of production-readiness hardening (moving campaign data into Postgres, replacing the Google Form with a self-hosted application page, narrowing Google OAuth scopes). It's not yet running background jobs for long operations (interview invites and outcome emails are still sent synchronously), so very large candidate pools should be sent in smaller batches for now.

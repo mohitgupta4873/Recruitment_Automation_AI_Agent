@@ -2,9 +2,11 @@
 Phase 0 (security hardening) + Phase 1 (Postgres-backed campaigns) +
 Phase 2 (public apply page) verification.
 """
+import os
 import shutil
 import tempfile
 
+from django.conf import settings
 from django.test import TestCase, override_settings
 from django.contrib.auth.models import User
 
@@ -552,3 +554,249 @@ class BackgroundTaskTests(TestCase):
         self.client.force_login(other)
         resp = self.client.get(f'/campaign/{self.campaign.pk}/status/')
         self.assertEqual(resp.status_code, 404)
+
+
+class LegalPagesTests(TestCase):
+    """Phase 4: privacy policy + terms are public, linked from the footer,
+    and the apply page's consent notice actually names a deletion contact."""
+
+    def test_privacy_page_loads(self):
+        resp = self.client.get('/privacy/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, 'Privacy Policy')
+
+    def test_terms_page_loads(self):
+        resp = self.client.get('/terms/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, 'Terms of Service')
+
+    def test_footer_links_to_both_on_a_public_page(self):
+        resp = self.client.get('/')
+        self.assertContains(resp, '/privacy/')
+        self.assertContains(resp, '/terms/')
+
+    def test_apply_page_notice_names_retention_and_contact(self):
+        user = User.objects.create_user(username='nora', password='Str0ng!Passphrase42')
+        campaign = Campaign.objects.create(owner=user, role='Analyst', status='active')
+        resp = self.client.get(f'/apply/{campaign.public_token}/')
+        self.assertContains(resp, str(campaign.retention_days))
+        self.assertContains(resp, settings.PRIVACY_CONTACT_EMAIL)
+
+
+class AdminRegistrationTests(TestCase):
+    """Phase 4: Campaign/Candidate need to be admin-manageable to service
+    erasure requests; GoogleOAuthToken deliberately stays unregistered — it's
+    encrypted OAuth credentials with no legitimate reason to browse in admin.
+    """
+
+    def test_campaign_and_candidate_are_registered(self):
+        from django.contrib import admin
+        self.assertIn(Campaign, admin.site._registry)
+        self.assertIn(Candidate, admin.site._registry)
+
+    def test_google_oauth_token_is_not_registered(self):
+        from django.contrib import admin
+        from hiring_app.models import GoogleOAuthToken
+        self.assertNotIn(GoogleOAuthToken, admin.site._registry)
+
+
+class ResumeRetentionTests(TestCase):
+    """Phase 4: resume files must not outlive the Candidate/Campaign rows
+    that reference them, and must be purged automatically once a closed
+    campaign's retention window elapses.
+
+    Writes real files via Candidate.resume, same reason as ApplyPageTests —
+    MEDIA_ROOT is overridden to a temp dir for the duration of this class.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._media_root = tempfile.mkdtemp(prefix='hireai-test-retention-')
+        cls._override = override_settings(MEDIA_ROOT=cls._media_root)
+        cls._override.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._override.disable()
+        shutil.rmtree(cls._media_root, ignore_errors=True)
+        super().tearDownClass()
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='priya', password='Str0ng!Passphrase42')
+        self.campaign = Campaign.objects.create(owner=self.user, role='Designer', status='active')
+
+    def _candidate_with_resume(self, **overrides):
+        from django.core.files.base import ContentFile
+        defaults = dict(campaign=self.campaign, email='res@example.com', text_preview='some extracted text')
+        defaults.update(overrides)
+        candidate = Candidate.objects.create(**defaults)
+        candidate.resume.save('resume.pdf', ContentFile(b'%PDF-1.1\nfake'), save=True)
+        return candidate
+
+    def test_deleting_candidate_removes_resume_file_from_disk(self):
+        candidate = self._candidate_with_resume()
+        path = candidate.resume.path
+        self.assertTrue(os.path.exists(path))
+        candidate.delete()
+        self.assertFalse(os.path.exists(path))
+
+    def test_deleting_campaign_cascades_and_removes_resume_files(self):
+        candidate = self._candidate_with_resume()
+        path = candidate.resume.path
+        self.campaign.delete()
+        self.assertFalse(os.path.exists(path))
+
+    def test_purge_leaves_active_campaign_untouched(self):
+        from hiring_app.tasks import purge_expired_resumes
+        candidate = self._candidate_with_resume()
+        # status stays 'active' / closed_at stays None from setUp.
+        result = purge_expired_resumes()
+        self.assertEqual(result, {'campaigns_swept': 0, 'candidates_purged': 0})
+        candidate.refresh_from_db()
+        self.assertTrue(candidate.resume)
+        self.assertTrue(os.path.exists(candidate.resume.path))
+
+    def test_purge_leaves_recently_closed_campaign_untouched(self):
+        from django.utils import timezone
+        from hiring_app.tasks import purge_expired_resumes
+        candidate = self._candidate_with_resume()
+        self.campaign.status = 'completed'
+        self.campaign.closed_at = timezone.now()  # closed just now — well within retention_days
+        self.campaign.save()
+
+        result = purge_expired_resumes()
+        self.assertEqual(result, {'campaigns_swept': 0, 'candidates_purged': 0})
+        candidate.refresh_from_db()
+        self.assertTrue(candidate.resume)
+
+    def test_purge_clears_resume_and_text_preview_past_retention(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from hiring_app.tasks import purge_expired_resumes
+
+        candidate = self._candidate_with_resume()
+        path = candidate.resume.path
+        self.campaign.status = 'completed'
+        self.campaign.retention_days = 30
+        self.campaign.closed_at = timezone.now() - timedelta(days=31)
+        self.campaign.save()
+
+        result = purge_expired_resumes()
+        self.assertEqual(result, {'campaigns_swept': 1, 'candidates_purged': 1})
+
+        candidate.refresh_from_db()
+        self.assertFalse(candidate.resume)
+        self.assertEqual(candidate.text_preview, '')
+        self.assertFalse(os.path.exists(path))
+        # The candidate record itself survives — only the file/text are purged.
+        self.assertTrue(Candidate.objects.filter(pk=candidate.pk).exists())
+
+    def test_purge_is_a_noop_the_second_time(self):
+        """Nothing left to clear on a re-run shouldn't error or re-count."""
+        from datetime import timedelta
+        from django.utils import timezone
+        from hiring_app.tasks import purge_expired_resumes
+
+        self._candidate_with_resume()
+        self.campaign.status = 'completed'
+        self.campaign.retention_days = 30
+        self.campaign.closed_at = timezone.now() - timedelta(days=31)
+        self.campaign.save()
+
+        purge_expired_resumes()
+        result = purge_expired_resumes()
+        self.assertEqual(result, {'campaigns_swept': 1, 'candidates_purged': 0})
+
+
+class AccountDeletionTests(TestCase):
+    """Phase 4: a recruiter can permanently delete their own account, and
+    only their own — cascading to their campaigns, candidates, resume files,
+    and any connected Google grant."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._media_root = tempfile.mkdtemp(prefix='hireai-test-delete-')
+        cls._override = override_settings(MEDIA_ROOT=cls._media_root)
+        cls._override.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._override.disable()
+        shutil.rmtree(cls._media_root, ignore_errors=True)
+        super().tearDownClass()
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='quinn', password='Str0ng!Passphrase42')
+        self.campaign = Campaign.objects.create(owner=self.user, role='PM', status='active')
+        self.candidate = Candidate.objects.create(campaign=self.campaign, email='c@example.com')
+        from django.core.files.base import ContentFile
+        self.candidate.resume.save('r.pdf', ContentFile(b'%PDF-1.1\nfake'), save=True)
+        self.resume_path = self.candidate.resume.path
+
+    def test_confirm_page_requires_login(self):
+        resp = self.client.get('/account/delete/')
+        self.assertEqual(resp.status_code, 302)  # redirected to login
+
+    def test_confirm_page_reports_counts(self):
+        self.client.force_login(self.user)
+        resp = self.client.get('/account/delete/')
+        self.assertEqual(resp.context['campaign_count'], 1)
+        self.assertEqual(resp.context['candidate_count'], 1)
+
+    def test_wrong_confirmation_text_deletes_nothing(self):
+        self.client.force_login(self.user)
+        resp = self.client.post('/account/delete/confirm/', {'confirm': 'delete'}, follow=True)
+        self.assertTrue(User.objects.filter(pk=self.user.pk).exists())
+        self.assertTrue(Campaign.objects.filter(pk=self.campaign.pk).exists())
+
+    def test_delete_requires_post(self):
+        self.client.force_login(self.user)
+        resp = self.client.get('/account/delete/confirm/')
+        self.assertEqual(resp.status_code, 405)
+
+    def test_confirmed_deletion_cascades_everything(self):
+        self.client.force_login(self.user)
+        user_id = self.user.pk
+        resp = self.client.post('/account/delete/confirm/', {'confirm': 'DELETE'})
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(resp['Location'], '/')
+
+        self.assertFalse(User.objects.filter(pk=user_id).exists())
+        self.assertFalse(Campaign.objects.filter(pk=self.campaign.pk).exists())
+        self.assertFalse(Candidate.objects.filter(pk=self.candidate.pk).exists())
+        self.assertFalse(os.path.exists(self.resume_path))
+
+    def test_deletion_logs_the_user_out(self):
+        self.client.force_login(self.user)
+        self.client.post('/account/delete/confirm/', {'confirm': 'DELETE'})
+        # A follow-up request to a login-required page should now bounce to login.
+        resp = self.client.get('/dashboard/')
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn('/login/', resp['Location'])
+
+    def test_deletion_revokes_and_removes_google_token(self):
+        from unittest.mock import patch
+        from hiring_app.models import GoogleOAuthToken
+        import json
+
+        GoogleOAuthToken.objects.create(
+            user=self.user, token_json=json.dumps({'refresh_token': 'rt-123'}),
+        )
+        self.client.force_login(self.user)
+        with patch('hiring_app.views.requests.post') as mock_post:
+            mock_post.return_value.status_code = 200
+            self.client.post('/account/delete/confirm/', {'confirm': 'DELETE'})
+            mock_post.assert_called_once()
+        self.assertFalse(GoogleOAuthToken.objects.filter(user__pk=self.user.pk).exists())
+
+    def test_deleting_one_account_does_not_touch_another_users_data(self):
+        other = User.objects.create_user(username='rex', password='Str0ng!Passphrase42')
+        other_campaign = Campaign.objects.create(owner=other, role='Other role', status='active')
+
+        self.client.force_login(self.user)
+        self.client.post('/account/delete/confirm/', {'confirm': 'DELETE'})
+
+        self.assertTrue(User.objects.filter(pk=other.pk).exists())
+        self.assertTrue(Campaign.objects.filter(pk=other_campaign.pk).exists())

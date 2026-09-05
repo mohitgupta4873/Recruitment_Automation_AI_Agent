@@ -124,8 +124,9 @@ If you want to test the Google integration locally: download OAuth 2.0 Client cr
 - Each user's Google OAuth token is encrypted at rest and scoped to that user only; there is no shared fallback credential.
 - Passwords are validated against Django's standard strength rules; sessions/CSRF use Django's built-in protections throughout.
 - Resume uploads are validated for file type (PDF magic bytes, not just the extension) and capped in size before being parsed.
-- State-changing actions require POST and, for irreversible bulk actions (sending offers/rejections to an entire candidate pool), a typed confirmation.
+- State-changing actions require POST and, for irreversible bulk actions (sending offers/rejections to an entire candidate pool, or deleting your own account), a typed confirmation.
 - Rate limiting is enforced on login, registration, and the public application page.
+- Candidate resumes are automatically deleted a configurable number of days after a campaign closes; a recruiter can permanently delete their own account — and every campaign, candidate, and resume file it owns — from the dashboard. See the [Privacy Policy](hiring_app/templates/hiring_app/privacy.html) (served at `/privacy/`) for the full data-handling notice.
 
 🧪 Tests
 
@@ -135,4 +136,4 @@ python manage.py test
 
 📍 Status
 
-This app has been through several rounds of production-readiness hardening (moving campaign data into Postgres, replacing the Google Form with a self-hosted application page, narrowing Google OAuth scopes, moving interview invites and outcome emails to a background task queue). Not yet in place: a privacy policy, a data retention policy, and account/candidate deletion — all real requirements given the app handles resumes belonging to people who aren't its users.
+This app has been through several rounds of production-readiness hardening (moving campaign data into Postgres, replacing the Google Form with a self-hosted application page, narrowing Google OAuth scopes, moving interview invites and outcome emails to a background task queue, and adding a privacy policy, resume retention, and account/candidate deletion). Not yet in place: the Google OAuth consent screen is still in Testing mode — public launch needs it verified and published, which needs a real domain this hasn't been deployed against yet.

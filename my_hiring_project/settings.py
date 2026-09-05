@@ -267,6 +267,16 @@ ADMIN_EMAIL = env('ADMIN_EMAIL', default='')  # for error emails
 if ADMIN_EMAIL:
     ADMINS = [('Admin', ADMIN_EMAIL)]
 
+# ── Privacy contact (Phase 4) ───────────────────────────────────
+# Shown on the privacy policy and apply-page notice as the address for
+# access/deletion requests. Deliberately separate from ADMIN_EMAIL (that one
+# gets raw 500-error tracebacks — not a mailbox to expose to the public) and
+# from DEFAULT_FROM_EMAIL (a no-reply send-only address). Falls back to
+# ADMIN_EMAIL only so local dev/staging without a dedicated address set still
+# renders something real instead of a placeholder; set it explicitly before
+# a real launch.
+PRIVACY_CONTACT_EMAIL = env('PRIVACY_CONTACT_EMAIL', default=ADMIN_EMAIL or 'privacy@example.com')
+
 # ── Email ─────────────────────────────────────────────────────
 # Used for password reset as well as 500-error notifications, so this is no
 # longer optional: without it a locked-out user has no recovery path.

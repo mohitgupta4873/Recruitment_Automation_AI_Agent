@@ -4,6 +4,8 @@ import uuid
 from cryptography.fernet import Fernet, InvalidToken
 from django.conf import settings
 from django.db import models
+from django.db.models.signals import post_delete
+from django.dispatch import receiver
 from django.contrib.auth.models import User
 
 
@@ -117,6 +119,16 @@ class Campaign(models.Model):
     email_qid        = models.CharField(max_length=255, blank=True)   # legacy Forms question ID
     linkedin_post_id = models.CharField(max_length=255, blank=True)   # legacy — see services.py history
 
+    # Phase 4 (retention). closed_at is stamped once, the first time status
+    # becomes 'completed' (see tasks.send_outcomes_task) — not on every save,
+    # so it records when the campaign actually stopped accepting outcomes,
+    # not when it was last touched. retention_days is how long candidate
+    # resumes/text_preview survive after that before purge_expired_resumes
+    # (hiring_app/tasks.py) clears them; configurable per campaign since a
+    # recruiter may be bound to a longer/shorter policy than the default.
+    retention_days = models.PositiveIntegerField(default=180)
+    closed_at      = models.DateTimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -226,3 +238,19 @@ class Candidate(models.Model):
 
     def __str__(self):
         return f"{self.email} → {self.campaign.role}"
+
+
+@receiver(post_delete, sender=Candidate)
+def _delete_resume_file_on_candidate_delete(sender, instance, **kwargs):
+    """Deleting a Candidate row didn't used to delete its resume file from
+    disk (Django's FileField never does this on its own) — the file was
+    orphaned under media/resumes/<campaign-id>/ forever. This fires whenever
+    a Candidate is deleted: directly (admin erasure request), cascaded from
+    a Campaign delete, or cascaded from a User delete (account deletion) —
+    registering this receiver also stops Django's cascade-delete Collector
+    from "fast-deleting" Candidate rows in bulk, since a fast-delete skips
+    signals entirely; every Candidate is now deleted (and its file cleaned
+    up) one row at a time regardless of which path triggered it.
+    """
+    if instance.resume:
+        instance.resume.delete(save=False)

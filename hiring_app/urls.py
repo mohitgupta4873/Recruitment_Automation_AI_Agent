@@ -52,6 +52,10 @@ urlpatterns = _password_urls + [
     path('register/', views.register_view, name='register'),
     path('logout/', LogoutView.as_view(), name='logout'),
 
+    # Phase 4 — legal pages, linked from the footer and the apply page.
+    path('privacy/', views.privacy_policy, name='privacy'),
+    path('terms/', views.terms_of_service, name='terms'),
+
     # The public candidate-facing application form — replaces the Google Form
     # as of Phase 2. No login, no campaign_id: public_token alone identifies
     # the campaign (see Campaign.public_token).
@@ -65,6 +69,12 @@ urlpatterns = _password_urls + [
     # Dashboard & Multi-Campaign
     path('dashboard/', views.dashboard_overview, name='dashboard'),
     path('campaign/new/', views.new_campaign, name='new_campaign'),
+
+    # Phase 4 — account deletion. GET shows what will be removed and asks for
+    # a typed confirmation; POST (a separate URL, like send_outcomes) is the
+    # actual irreversible action.
+    path('account/delete/', views.delete_account_confirm, name='delete_account_confirm'),
+    path('account/delete/confirm/', views.delete_account, name='delete_account'),
 
     # 'agent/' is a convenience redirect (no campaign_id) that resolves to a
     # specific campaign and forwards there — kept so nav links and the

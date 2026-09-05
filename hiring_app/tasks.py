@@ -22,6 +22,7 @@ safe. This is the specific scenario ROADMAP.md's Phase 3 "Verify" section
 calls out: kill the worker mid-run, restart it, confirm no one is emailed twice.
 """
 import logging
+from datetime import timedelta
 
 from celery import shared_task
 from django.utils import timezone
@@ -90,7 +91,9 @@ def send_outcomes_task(self, campaign_id, hired_candidate_ids):
     if not candidates:
         logger.info(f"send_outcomes_task: campaign={campaign_id} — nothing left to send")
         campaign.status = 'completed'
-        campaign.save(update_fields=['status', 'updated_at'])
+        if campaign.closed_at is None:
+            campaign.closed_at = timezone.now()
+        campaign.save(update_fields=['status', 'closed_at', 'updated_at'])
         return {'sent': 0, 'skipped': already_done, 'failed': 0}
 
     creds = get_user_google_creds(campaign.owner)
@@ -108,10 +111,59 @@ def send_outcomes_task(self, campaign_id, hired_candidate_ids):
     # was made and acted on, even if a handful of addresses bounced. Those
     # failures are visible in the count returned here, not hidden.
     campaign.status = 'completed'
-    campaign.save(update_fields=['status', 'updated_at'])
+    if campaign.closed_at is None:
+        campaign.closed_at = timezone.now()
+    campaign.save(update_fields=['status', 'closed_at', 'updated_at'])
 
     logger.info(
         f"send_outcomes_task: campaign={campaign_id} — {len(results) - failed} sent, "
         f"{failed} failed, {already_done} already done"
     )
     return {'sent': len(results) - failed, 'skipped': already_done, 'failed': failed}
+
+
+@shared_task
+def purge_expired_resumes():
+    """Phase 4 retention: delete resume files and text_preview for candidates
+    of a *closed* (status='completed') campaign once `closed_at +
+    retention_days` has passed. Scheduled daily via app.conf.beat_schedule
+    in my_hiring_project/celery.py — requires a running `celery ... beat`
+    process, separate from the worker (see render.yaml).
+
+    Iterates campaigns rather than expressing the whole thing as one queryset
+    filter: retention_days varies per campaign, and Django's ORM has no clean
+    way to compare `closed_at + F('retention_days') days` against now() at
+    the DB level without a raw expression. Campaign volume here is small
+    enough (one row per hiring campaign, not per candidate) that this is a
+    non-issue in practice.
+
+    Only ever clears the resume file + text_preview — never deletes the
+    Candidate row itself (that stays until an explicit erasure request, see
+    hiring_app/admin.py) and never touches campaigns that are still draft/
+    active, since those have no closed_at yet to measure retention from.
+    """
+    from .models import Campaign
+
+    purged_candidates = 0
+    campaigns_swept = 0
+
+    closed_campaigns = Campaign.objects.filter(status='completed', closed_at__isnull=False)
+    for campaign in closed_campaigns.iterator():
+        deadline = campaign.closed_at + timedelta(days=campaign.retention_days)
+        if timezone.now() < deadline:
+            continue
+
+        campaigns_swept += 1
+        candidates = campaign.candidates.exclude(resume='', text_preview='')
+        for candidate in candidates.iterator():
+            if candidate.resume:
+                candidate.resume.delete(save=False)
+            candidate.text_preview = ''
+            candidate.save(update_fields=['resume', 'text_preview', 'updated_at'])
+            purged_candidates += 1
+
+    logger.info(
+        f"purge_expired_resumes: {campaigns_swept} campaign(s) past retention, "
+        f"{purged_candidates} candidate(s) purged"
+    )
+    return {'campaigns_swept': campaigns_swept, 'candidates_purged': purged_candidates}

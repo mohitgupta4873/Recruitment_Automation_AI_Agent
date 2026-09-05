@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Django app that automates an end-to-end hiring workflow: generate a JD with Gemini → launch a campaign with its own public apply page (optionally with a Google Sheet for tracking) → candidates apply directly with a resume upload, which is scored against AI-derived keywords for the role → send Google Calendar interview invites → send offer/rejection emails and log outcomes. Google (Sheets export, Gmail send) is optional throughout — every step also works through Django's own email backend when it isn't connected. Invites and outcomes run as background Celery tasks, not inline in the request.
+A Django app that automates an end-to-end hiring workflow: generate a JD with Gemini → launch a campaign with its own public apply page (optionally with a Google Sheet for tracking) → candidates apply directly with a resume upload, which is scored against AI-derived keywords for the role → send Google Calendar interview invites → send offer/rejection emails and log outcomes. Google (Sheets export, Gmail send) is optional throughout — every step also works through Django's own email backend when it isn't connected. Invites and outcomes run as background Celery tasks, not inline in the request. Candidate resumes are auto-purged N days after a campaign closes, and a recruiter can permanently delete their own account (and everything owned by it) from their dashboard.
 
 There is effectively one Django app, `hiring_app`, inside the project `my_hiring_project`. Almost all business logic lives in `hiring_app/services.py` (Google/Gemini calls) and `hiring_app/models.py` (persistence). `hiring_app/views.py` is a thin controller layer over both.
 
@@ -26,17 +26,25 @@ python manage.py runserver
 # `runserver` alone is enough for normal development)
 celery -A my_hiring_project worker --loglevel=info
 
+# Run Celery beat (optional — only needed to test the daily retention purge
+# actually firing on schedule; see hiring_app/tasks.py:purge_expired_resumes
+# and my_hiring_project/celery.py's beat_schedule)
+celery -A my_hiring_project beat --loglevel=info
+
 # DB migrations
 python manage.py makemigrations
 python manage.py migrate
 
 # Run tests — hiring_app/tests.py covers Phase 0 security hardening (method
 # guards, password policy, recipient validation), Phase 1 (ownership,
-# encryption), Phase 2 (apply-page validation, scoring), and Phase 3
-# (background-task idempotency). File storage under test is redirected to a
-# temp dir (ApplyPageTests) — don't remove that override, or running the
-# suite writes real files under media/resumes/. Celery tasks run eagerly
-# under the test runner (settings.py: `if TESTING`) — no broker needed.
+# encryption), Phase 2 (apply-page validation, scoring), Phase 3
+# (background-task idempotency), and Phase 4 (resume-file cleanup on delete,
+# retention purge, account deletion, legal pages). File storage under test is
+# redirected to a temp dir wherever a test writes a real Candidate.resume
+# file (ApplyPageTests, ResumeRetentionTests, AccountDeletionTests) — don't
+# remove those overrides, or running the suite writes real files under
+# media/resumes/. Celery tasks run eagerly under the test runner
+# (settings.py: `if TESTING`) — no broker needed.
 python manage.py test
 
 # Django's own checks. The --deploy variant is the pre-launch gate and must
@@ -63,7 +71,7 @@ database (see Architecture). Safe to re-run; already-imported campaigns are skip
 
 - `build.sh` runs `pip install`, `collectstatic`, then `migrate` — this is the production build step, not something to run ad hoc in dev.
 - `Procfile` runs gunicorn against `my_hiring_project.wsgi`. It does **not** run the Celery worker — that's a separate process (`celery -A my_hiring_project worker`), which `Procfile` alone (single-service) has no way to express.
-- `render.yaml` (added Phase 3) declares both the web service and a worker service, plus managed Postgres and a Key Value (Redis) instance, as an optional Render Blueprint. It's additive — `build.sh`/`Procfile` are untouched and keep working exactly as they do now whether or not this Blueprint is ever adopted. **Not deployed or verified against a real Render account** — written from documentation; review every value before adopting it.
+- `render.yaml` (added Phase 3, extended Phase 4) declares the web service, a worker service, a beat service (`hireai-beat` — fires the daily retention purge, see Architecture below), plus managed Postgres and a Key Value (Redis) instance, as an optional Render Blueprint. It's additive — `build.sh`/`Procfile` are untouched and keep working exactly as they do now whether or not this Blueprint is ever adopted. **Not deployed or verified against a real Render account** — written from documentation; review every value before adopting it.
 - Static files are served by WhiteNoise via the `STORAGES['staticfiles']` setting. The manifest backend is used outside DEBUG and outside the test runner (`USE_MANIFEST_STATIC` overrides), so after touching anything in `hiring_app/static/`, `collectstatic` needs to run before it will show up in a production-like run.
 
 ## Architecture
@@ -264,6 +272,61 @@ Docker daemon running). What *is* verified (`hiring_app/tests.py:
 BackgroundTaskTests`) is that re-invoking a task for work already completed
 is a no-op — the actual idempotency guarantee this phase depends on. Do that
 worker-kill test for real before relying on it under production load.
+
+### PII, retention, and account deletion (Phase 4)
+
+The app processes resumes belonging to candidates who are not its users, so this phase
+is about giving that data a lifecycle rather than letting it accumulate forever.
+
+- **Legal pages.** `/privacy/` and `/terms/` (`views.privacy_policy`/`terms_of_service`,
+  `templates/hiring_app/privacy.html`/`terms.html`) are public, linked from `base.html`'s
+  footer and from the apply page. Both are explicitly marked as drafts pending real legal
+  review in their own text — accurate about what the app does today, but not a substitute
+  for a lawyer, especially before hiring in the EU (AI Act) or NYC (Local Law 144); see
+  the "Automated scoring" section of the privacy page. A hosted privacy policy is also a
+  hard requirement for the Google OAuth verification in Phase 5.
+- **Cookie notice** lives inside the privacy policy rather than as a separate consent
+  banner — the app sets exactly two cookies (session, CSRF), both strictly necessary, and
+  strictly-necessary cookies don't require consent under GDPR/ePrivacy. Adding a banner
+  for cookies that don't need one would be theater, not compliance.
+- **Consent** on `/apply/` was already collected as of Phase 2 (`Candidate.consent_at`,
+  stamped in `HiringAutomator.process_application`) — this phase only improved the
+  *notice* text above the checkbox to actually name who's processing the data (the
+  campaign owner, with HireAI as their processor), the retention window
+  (`campaign.retention_days`), and a deletion contact (`settings.PRIVACY_CONTACT_EMAIL`),
+  linking through to the privacy policy for the rest.
+- **Retention.** `Campaign.retention_days` (default 180) and `Campaign.closed_at` (stamped
+  once, the first time `tasks.send_outcomes_task` sets `status='completed'` — not on every
+  save) drive `tasks.purge_expired_resumes`: a daily Celery Beat task that, for every
+  completed campaign past `closed_at + retention_days`, clears each candidate's resume
+  file and `text_preview` — never the `Candidate` row itself. Beat schedule lives in
+  `my_hiring_project/celery.py` (`app.conf.beat_schedule`); it needs its own
+  `celery -A my_hiring_project beat` process, separate from the worker (see `render.yaml`'s
+  `hireai-beat` service) — a worker alone never fires scheduled tasks.
+- **Resume files no longer outlive their row.** Deleting a `Candidate` never used to touch
+  its file in storage — `FileField` doesn't do that on its own — so it was orphaned under
+  `media/resumes/<campaign-id>/` forever. A `post_delete` signal on `Candidate`
+  (`hiring_app/models.py`) now deletes the file whenever the row goes, whatever the
+  path: a direct admin delete, a cascaded `Campaign.delete()`, or a cascaded account
+  deletion (below). Registering that signal also stops Django's cascade-delete
+  `Collector` from "fast-deleting" `Candidate` rows in bulk (fast-delete skips signals
+  entirely), so every cascade now goes through one row at a time — the correctness this
+  buys is worth that cost at this app's scale.
+- **Account deletion.** `views.delete_account_confirm` (GET, shows exact counts) and
+  `views.delete_account` (POST, typed `DELETE` confirmation — same pattern as
+  `send_outcomes`) let a recruiter permanently remove their own account:
+  `_revoke_google_token` (Phase 0) revokes any connected Google grant, then
+  `request.user.delete()` cascades through every owned `Campaign` → `Candidate` →
+  resume file (via the signal above) and the user's `GoogleOAuthToken` row. `logout()`
+  runs before the delete so the session is invalidated even though the `User` row it
+  pointed at no longer exists a moment later.
+- **Candidate erasure requests** (someone who applied asks to be forgotten, without
+  deleting the recruiter's whole account) are serviced through Django admin:
+  `hiring_app/admin.py` registers `Campaign` and `Candidate` with `search_fields`
+  including `email`, specifically so a candidate can be found and deleted (triggering the
+  same file-cleanup signal) without a bespoke UI for what should be a rare request.
+  `GoogleOAuthToken` is deliberately **not** registered — it's encrypted OAuth credentials
+  with no legitimate reason to browse from admin.
 
 ### Error reporting to the user
 

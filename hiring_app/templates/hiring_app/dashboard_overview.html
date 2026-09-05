@@ -192,6 +192,20 @@
           </div>
         </div>
 
+        <!-- Danger zone -->
+        <div class="card animate-fade-up delay-2" style="border-color:rgba(239,68,68,0.25);">
+          <div class="card-header">
+            <div class="card-title" style="color:#f87171;">Danger Zone</div>
+          </div>
+          <p style="font-size:0.78rem; color:var(--text-muted); margin-bottom:0.75rem;">
+            Permanently delete your account, every campaign you own, and every candidate
+            application (including resume files) inside them.
+          </p>
+          <a href="{% url 'delete_account_confirm' %}" class="btn btn-sm btn-danger" style="width:100%;">
+            Delete account
+          </a>
+        </div>
+
       </div>
     </div>
 

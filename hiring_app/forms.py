@@ -36,10 +36,7 @@ class ApplicationForm(forms.Form):
     )
     consent = forms.BooleanField(
         required=True,
-        label=(
-            "I consent to my resume and application details being stored and "
-            "automatically scored for this application."
-        ),
+        label="I agree to my data being handled as described above.",
         widget=forms.CheckboxInput(attrs={'class': 'fancy-check'}),
     )
 

@@ -1,0 +1,131 @@
+{% extends 'hiring_app/base.html' %}
+
+{% block title %}Privacy Policy — HireAI{% endblock %}
+{% block meta_desc %}How HireAI and the recruiters who use it handle candidate and account data.{% endblock %}
+
+{% block content %}
+<div class="main-content">
+  <div class="container" style="max-width:760px;">
+    <div class="card" style="padding:2.5rem; line-height:1.7;">
+
+      <h1 class="page-title" style="margin-bottom:0.25rem;">Privacy Policy</h1>
+      <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:2rem;">Last updated: 2026-09-05</p>
+
+      <div class="auth-error" style="text-align:left; margin-bottom:2rem;">
+        <span>
+          <strong>Draft, not yet legal-reviewed.</strong> This page is written to be
+          accurate about what the application actually does today. It has not been
+          reviewed by a lawyer and should be before HireAI is used to process real
+          candidates' data at any scale, particularly for hiring in the EU or New York
+          City (see "Automated scoring" below).
+        </span>
+      </div>
+
+      <h2>Who this covers</h2>
+      <p>
+        HireAI is a hiring-automation tool: a recruiter ("the <strong>campaign owner</strong>")
+        creates a campaign for a role, and candidates apply through that campaign's own
+        public application page. Two different relationships fall under this policy:
+      </p>
+      <ul style="padding-left:1.4rem; margin-bottom:1.2rem;">
+        <li><strong>Recruiter accounts.</strong> If you have a HireAI login, we are the
+          controller of your account data (username, email, password hash, and — if you
+          connect it — your Google OAuth credentials).</li>
+        <li><strong>Candidate applications.</strong> If you applied to a role through a
+          HireAI-hosted apply page, the <strong>campaign owner</strong> (the recruiter who
+          created that campaign) is the controller of your application data — they decide
+          who to interview and hire. HireAI acts as their processor: we host the
+          infrastructure that stores, scores, and lets them act on your application, but
+          we do not decide how it's used.
+        </li>
+      </ul>
+
+      <h2>What we collect</h2>
+      <ul style="padding-left:1.4rem; margin-bottom:1.2rem;">
+        <li><strong>From recruiters:</strong> account details (username, email, password —
+          stored as a salted hash, never in plain text); if Google is connected, an
+          encrypted OAuth credential used only to send email as you and export a tracking
+          spreadsheet, both actions you trigger.</li>
+        <li><strong>From candidates:</strong> full name, email, years of experience, a
+          short free-text pitch, an optional LinkedIn URL, and the resume file itself. The
+          resume is parsed to extract text, which is scored against a list of keywords the
+          recruiter's job description implies — <strong>a resume is never sent anywhere
+          outside this app for scoring</strong> beyond the AI call that turns the job
+          description into that keyword list.</li>
+      </ul>
+
+      <h2>Cookies</h2>
+      <p>
+        HireAI sets exactly two cookies, both strictly necessary for the site to function
+        and neither used for tracking or advertising: a session cookie (keeps you signed
+        in) and a CSRF cookie (protects form submissions from cross-site forgery). No
+        analytics, advertising, or third-party tracking cookies are set. Because both
+        cookies are strictly necessary, no separate cookie-consent banner is shown —
+        this section is that disclosure.
+      </p>
+
+      <h2>How long we keep it</h2>
+      <p>
+        Recruiter account data is kept for as long as the account exists — see "Deleting
+        your account" below for how to remove it entirely.
+      </p>
+      <p>
+        Candidate resumes and the extracted text are kept while a campaign is open, and
+        for a limited period after the recruiter closes it (the campaign's retention
+        window, configurable per campaign, defaulting to 180 days) — after which the
+        resume file and extracted text are automatically and permanently deleted. The
+        rest of the application record (name, email, score, outcome) is retained for the
+        recruiter's own hiring records unless a deletion request is made.
+      </p>
+
+      <h2>Your rights, and how to exercise them</h2>
+      <p>
+        You can ask for your application data to be deleted from a specific campaign at
+        any time — email <strong>{{ privacy_contact_email }}</strong> with the campaign
+        and the email address you applied with, and we will remove the resume file and
+        application record. Recruiters can also action this directly for campaigns they
+        own. If you have a HireAI account yourself, you can delete it — and everything
+        tied to it — from your dashboard; see "Deleting your account" below.
+      </p>
+
+      <h2>Deleting your account</h2>
+      <p>
+        Recruiters can permanently delete their HireAI account from the dashboard. This
+        immediately: disconnects and revokes any connected Google account, deletes every
+        campaign you own along with every candidate application and resume file inside
+        those campaigns, and removes your login. This action cannot be undone.
+      </p>
+
+      <h2>Automated scoring</h2>
+      <p>
+        Every candidate's resume is scored automatically against a keyword list derived
+        from the role's job description. <strong>This score is advisory only</strong> — it
+        is a starting point for a human recruiter's own review, never an automatic
+        accept or reject, and HireAI does not make hiring decisions. Recruiters using
+        this tool to hire in jurisdictions with automated-employment-decision-tool
+        requirements (for example, New York City Local Law 144, or the EU AI Act's
+        high-risk classification for employment AI) are responsible for their own
+        compliance with those rules, including any required bias audit or candidate
+        notice beyond what this page provides.
+      </p>
+
+      <h2>Third parties</h2>
+      <p>
+        We use Google's Gemini API to draft job descriptions and derive scoring keywords
+        from them — no candidate resume content is sent to this API. If a recruiter
+        connects their own Google account, invite emails and tracking-sheet exports are
+        sent through their Google account under their own Google terms, not ours. If
+        Google isn't connected, email is sent through our own transactional email
+        provider instead.
+      </p>
+
+      <h2>Contact</h2>
+      <p>
+        Questions about this policy, or a request to access or delete data covered by
+        it: <strong>{{ privacy_contact_email }}</strong>.
+      </p>
+
+    </div>
+  </div>
+</div>
+{% endblock %}

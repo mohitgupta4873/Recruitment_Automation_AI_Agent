@@ -62,6 +62,37 @@ services:
       # FIELD_ENCRYPTION_KEY (it decrypts GoogleOAuthToken rows), and
       # EMAIL_* (it's what actually sends invite/outcome mail).
 
+  - type: worker
+    name: hireai-beat
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: celery -A my_hiring_project beat --loglevel=info
+    envVars:
+      - key: DEBUG
+        value: "False"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: hireai-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: hireai-redis
+          property: connectionString
+      # Same secrets as hireai-web/hireai-worker. This process only fires the
+      # daily purge_expired_resumes schedule (see my_hiring_project/celery.py)
+      # — it does not itself need GEMINI_API_KEY or EMAIL_*, but Django still
+      # needs the same required settings (SECRET_KEY, FIELD_ENCRYPTION_KEY)
+      # to boot at all.
+      #
+      # Uses Celery's default file-based PersistentScheduler
+      # (celerybeat-schedule) — on Render's ephemeral filesystem that file is
+      # lost on every restart/redeploy, so a restart can cause one extra
+      # (harmless, idempotent) run of the daily task rather than none. Move
+      # to django-celery-beat's DB-backed scheduler if this ever needs more
+      # than one daily cron entry.
+
   - type: keyvalue
     name: hireai-redis
     plan: starter
@@ -73,10 +104,10 @@ databases:
     databaseName: hireai
     user: hireai
 
-# No `beat` service: there are no scheduled tasks yet. ROADMAP.md Phase 4's
-# purge_expired_resumes will need one — add a `type: cron` (or a `beat`
-# worker, depending on what Render supports when that lands) at that point,
-# not before.
+# hireai-beat above (Phase 4) runs the one scheduled task that exists today,
+# purge_expired_resumes. If Render's `type: cron` fits better than a
+# long-running `beat` worker process by the time this is actually adopted,
+# that's a one-line swap — revisit then, not guessed at here.
 #
 # Migrations: still run from build.sh (`python manage.py migrate`), not a
 # separate preDeployCommand. ROADMAP.md's original Phase 3 note suggested

@@ -1,0 +1,52 @@
+{% extends 'hiring_app/base.html' %}
+
+{% block title %}Delete account — HireAI{% endblock %}
+
+{% block content %}
+<div class="auth-page">
+  <div class="auth-card" style="max-width:640px;">
+
+    <h1 class="auth-heading">Delete your account</h1>
+    <p class="auth-subheading">
+      This permanently deletes your account and everything tied to it. It cannot be undone.
+    </p>
+
+    <div class="auth-error" style="text-align:left;">
+      <span>
+        This will delete <strong>{{ campaign_count }}</strong> campaign{{ campaign_count|pluralize }}
+        and <strong>{{ candidate_count }}</strong> candidate application{{ candidate_count|pluralize }}
+        (including every stored resume file){% if has_google %}, and disconnect and revoke
+        your connected Google account{% endif %}.
+      </span>
+    </div>
+
+    <form method="post" action="{% url 'delete_account' %}">
+      {% csrf_token %}
+
+      <div class="form-group">
+        <label class="form-label" for="confirm-input">
+          Type <code>DELETE</code> to confirm
+        </label>
+        <input
+          type="text"
+          id="confirm-input"
+          name="confirm"
+          class="form-control"
+          placeholder="DELETE"
+          autocomplete="off"
+          required
+        >
+      </div>
+
+      <button type="submit" class="btn btn-danger btn-full">
+        Permanently delete my account
+      </button>
+    </form>
+
+    <p class="auth-footer">
+      <a href="{% url 'dashboard' %}">Cancel and go back</a>
+    </p>
+
+  </div>
+</div>
+{% endblock %}

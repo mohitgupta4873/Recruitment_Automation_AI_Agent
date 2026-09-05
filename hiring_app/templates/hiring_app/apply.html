@@ -66,6 +66,14 @@
         {% for e in form.linkedin_url.errors %}<div class="field-error">{{ e }}</div>{% endfor %}
       </div>
 
+      <div class="form-group" style="font-size:0.8rem; color:var(--text-muted); line-height:1.5;">
+        Your application is stored and scored by the recruiter running this campaign,
+        using HireAI to process it on their behalf. Resumes are kept for up to
+        {{ campaign.retention_days }} days after this campaign closes, then automatically
+        deleted. To request earlier deletion, email {{ privacy_contact_email }}. Full
+        details: <a href="{% url 'privacy' %}" target="_blank">Privacy Policy</a>.
+      </div>
+
       <div class="form-group apply-consent">
         <label class="apply-consent-label">
           {{ form.consent }}

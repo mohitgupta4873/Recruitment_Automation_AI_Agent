@@ -8,7 +8,7 @@ from django.shortcuts import render, redirect, get_object_or_404
 from django.urls import reverse
 from django.conf import settings
 from django.contrib import messages
-from django.contrib.auth import login
+from django.contrib.auth import login, logout
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
@@ -189,7 +189,27 @@ def apply(request, public_token):
     else:
         form = ApplicationForm()
 
-    return render(request, 'hiring_app/apply.html', {'campaign': campaign, 'form': form})
+    return render(request, 'hiring_app/apply.html', {
+        'campaign': campaign,
+        'form': form,
+        'privacy_contact_email': settings.PRIVACY_CONTACT_EMAIL,
+    })
+
+
+# ─────────────────────────────────────────────────────────────
+# PUBLIC — Legal pages
+# ─────────────────────────────────────────────────────────────
+
+def privacy_policy(request):
+    return render(request, 'hiring_app/privacy.html', {
+        'privacy_contact_email': settings.PRIVACY_CONTACT_EMAIL,
+    })
+
+
+def terms_of_service(request):
+    return render(request, 'hiring_app/terms.html', {
+        'privacy_contact_email': settings.PRIVACY_CONTACT_EMAIL,
+    })
 
 
 # ─────────────────────────────────────────────────────────────
@@ -306,6 +326,49 @@ def dashboard_overview(request):
         'has_google':       GoogleOAuthToken.objects.filter(user=user).exists(),
     }
     return render(request, 'hiring_app/dashboard_overview.html', context)
+
+
+# ─────────────────────────────────────────────────────────────
+# PROTECTED — Account deletion (Phase 4)
+# ─────────────────────────────────────────────────────────────
+
+@login_required
+def delete_account_confirm(request):
+    """Shows exactly what deleting the account will remove, before the
+    irreversible POST — same typed-confirmation pattern as send_outcomes."""
+    user = request.user
+    campaigns = Campaign.objects.filter(owner=user)
+    return render(request, 'hiring_app/delete_account_confirm.html', {
+        'campaign_count':  campaigns.count(),
+        'candidate_count': Candidate.objects.filter(campaign__owner=user).count(),
+        'has_google':      GoogleOAuthToken.objects.filter(user=user).exists(),
+    })
+
+
+@login_required
+@require_POST
+def delete_account(request):
+    """Permanently deletes the account and everything tied to it: revokes any
+    connected Google grant, then deletes the User row, which CASCADEs to
+    every Campaign the user owns, which CASCADEs to every Candidate in those
+    campaigns — and the post_delete signal on Candidate (models.py) removes
+    each one's resume file from disk as it goes. Nothing here targets
+    another user's data; `request.user` is the only row this can ever touch.
+    """
+    if request.POST.get('confirm') != 'DELETE':
+        messages.error(request, 'Type DELETE exactly to confirm account deletion.')
+        return redirect('delete_account_confirm')
+
+    user = request.user
+    token_record = GoogleOAuthToken.objects.filter(user=user).first()
+    if token_record:
+        _revoke_google_token(token_record)
+
+    logger.info(f"Account deletion requested for user id={user.id}")
+    logout(request)
+    user.delete()
+    messages.success(request, 'Your account and all its data have been permanently deleted.')
+    return redirect('landing')
 
 
 # ─────────────────────────────────────────────────────────────

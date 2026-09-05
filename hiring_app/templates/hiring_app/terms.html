@@ -1,0 +1,84 @@
+{% extends 'hiring_app/base.html' %}
+
+{% block title %}Terms of Service — HireAI{% endblock %}
+{% block meta_desc %}Terms for using HireAI as a recruiter or applying through it as a candidate.{% endblock %}
+
+{% block content %}
+<div class="main-content">
+  <div class="container" style="max-width:760px;">
+    <div class="card" style="padding:2.5rem; line-height:1.7;">
+
+      <h1 class="page-title" style="margin-bottom:0.25rem;">Terms of Service</h1>
+      <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:2rem;">Last updated: 2026-09-05</p>
+
+      <div class="auth-error" style="text-align:left; margin-bottom:2rem;">
+        <span>
+          <strong>Draft, not yet legal-reviewed.</strong> See the same note on the
+          <a href="{% url 'privacy' %}">Privacy Policy</a> — get this in front of a lawyer
+          before relying on it for real customers.
+        </span>
+      </div>
+
+      <h2>What HireAI is</h2>
+      <p>
+        HireAI is a hiring-automation tool. A recruiter account lets you draft a job
+        description, launch a public application page for it, receive and automatically
+        score candidate resumes, schedule interviews, and send offer or rejection emails.
+        See the <a href="{% url 'privacy' %}">Privacy Policy</a> for how data moves
+        through that process.
+      </p>
+
+      <h2>Recruiter accounts</h2>
+      <ul style="padding-left:1.4rem; margin-bottom:1.2rem;">
+        <li>You're responsible for keeping your login credentials confidential and for
+          all activity under your account.</li>
+        <li>You're responsible for the accuracy of job descriptions you publish and for
+          how you use candidate data collected through your campaigns — HireAI is a
+          processor of that data on your behalf, not the decision-maker (see Privacy
+          Policy, "Who this covers").</li>
+        <li>You may not use HireAI to collect candidate data for a purpose other than
+          genuine hiring, or to send bulk email to anyone who did not apply through your
+          own campaign.</li>
+        <li>If you connect a Google account, you're granting HireAI narrow, revocable
+          permission to send email and export a spreadsheet as you — revocable at any
+          time from your dashboard or from your Google account's own permissions page.</li>
+      </ul>
+
+      <h2>Candidates</h2>
+      <p>
+        Applying through a HireAI-hosted apply page means your application details and
+        resume are stored and automatically scored, as described on that apply page and
+        in the Privacy Policy. The recruiter who owns that campaign — not HireAI — makes
+        the actual hiring decision; the automated score is advisory only.
+      </p>
+
+      <h2>Acceptable use</h2>
+      <p>
+        Don't use HireAI to upload malicious files, attempt to access another user's
+        campaigns or candidates, circumvent rate limits, or use the platform to send
+        unsolicited email. Accounts found doing so may be suspended or deleted.
+      </p>
+
+      <h2>No warranty</h2>
+      <p>
+        HireAI, including its automated resume scoring, is provided "as is." Scores,
+        AI-generated job descriptions, and AI-derived keywords may be inaccurate or
+        incomplete, and are not a substitute for a recruiter's own judgment. We don't
+        guarantee uninterrupted availability.
+      </p>
+
+      <h2>Changes</h2>
+      <p>
+        These terms may change as the product changes. Material changes will be reflected
+        here with an updated date at the top of this page.
+      </p>
+
+      <h2>Contact</h2>
+      <p>
+        Questions about these terms: <strong>{{ privacy_contact_email }}</strong>.
+      </p>
+
+    </div>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,87 @@
+# Render Blueprint — added in Phase 3 alongside the Celery worker this app
+# now needs for interview invites and outcome emails (see hiring_app/tasks.py).
+#
+# This is additive, not a replacement for however the service is deployed
+# today: build.sh and Procfile are untouched, so an existing dashboard-
+# configured web service keeps working exactly as it does now, whether or
+# not this Blueprint is ever adopted. If you *do* adopt it (Render dashboard
+# → New → Blueprint, pointing at this repo), review every value below first —
+# it has not been deployed or verified against a real Render account.
+#
+# Before adopting: verify the current `envKeyPrefix`/Key Value/Redis syntax
+# against Render's own docs — their addon schema has changed over time and
+# this was written from documentation, not a live deploy.
+
+services:
+  - type: web
+    name: hireai-web
+    runtime: python
+    plan: starter
+    buildCommand: ./build.sh
+    startCommand: >-
+      gunicorn my_hiring_project.wsgi
+      --workers 2 --timeout 120
+      --max-requests 500 --max-requests-jitter 50
+      --access-logfile - --error-logfile -
+    envVars:
+      - key: DEBUG
+        value: "False"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: hireai-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: hireai-redis
+          property: connectionString
+      # SECRET_KEY, FIELD_ENCRYPTION_KEY, GEMINI_API_KEY, GOOGLE_CLIENT_SECRETS,
+      # ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS, EMAIL_* — set these as secrets in
+      # the Render dashboard, not here. See .env.example for the full list and
+      # what's required vs optional.
+
+  - type: worker
+    name: hireai-worker
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: celery -A my_hiring_project worker --loglevel=info --concurrency=2
+    envVars:
+      - key: DEBUG
+        value: "False"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: hireai-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: hireai-redis
+          property: connectionString
+      # Same secrets as hireai-web above — the worker needs GEMINI_API_KEY,
+      # FIELD_ENCRYPTION_KEY (it decrypts GoogleOAuthToken rows), and
+      # EMAIL_* (it's what actually sends invite/outcome mail).
+
+  - type: keyvalue
+    name: hireai-redis
+    plan: starter
+    ipAllowList: []   # internal-only; only hireai-web/hireai-worker need it
+
+databases:
+  - name: hireai-db
+    plan: starter
+    databaseName: hireai
+    user: hireai
+
+# No `beat` service: there are no scheduled tasks yet. ROADMAP.md Phase 4's
+# purge_expired_resumes will need one — add a `type: cron` (or a `beat`
+# worker, depending on what Render supports when that lands) at that point,
+# not before.
+#
+# Migrations: still run from build.sh (`python manage.py migrate`), not a
+# separate preDeployCommand. ROADMAP.md's original Phase 3 note suggested
+# moving it — deliberately not done here, since this web service still runs
+# a single instance and moving it would be a change to an already-working
+# path for a race condition (concurrent migrate across replicas) this app
+# doesn't hit yet at this scale. Revisit if/when hireai-web ever runs more
+# than one instance.

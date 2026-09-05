@@ -144,11 +144,11 @@ class NoSharedTokenFallbackTests(TestCase):
         from django.utils import timezone
         from hiring_app.services import HiringAutomator
         a = HiringAutomator(creds=None)
-        dt = a._parse_interview_datetime('2026-09-01T14:30')
+        dt = a.parse_interview_datetime('2026-09-01T14:30')
         self.assertFalse(timezone.is_naive(dt))
         self.assertEqual(dt.hour, 14)
         with self.assertRaises(ValueError):
-            a._parse_interview_datetime('not-a-date')
+            a.parse_interview_datetime('not-a-date')
 
     def test_scopes_no_longer_include_forms_or_drive(self):
         """The restricted `drive` scope (and the now-unused Forms scopes) are
@@ -452,3 +452,103 @@ class ScoringTests(TestCase):
     def test_empty_keywords_scores_zero_not_error(self):
         score, matched = self.automator._score_resume("anything", [])
         self.assertEqual((score, matched), (0, []))
+
+
+class BackgroundTaskTests(TestCase):
+    """Phase 3: invites/outcomes run as Celery tasks, not inline in the
+    request. CELERY_TASK_ALWAYS_EAGER is forced on under the test runner
+    (settings.py: `if TESTING`), so `.delay()` here runs synchronously in the
+    same process — no broker or worker needed to test the task logic itself.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='jack', password='Str0ng!Passphrase42')
+        self.campaign = Campaign.objects.create(owner=self.user, role='Engineer', status='active')
+        self.c1 = Candidate.objects.create(campaign=self.campaign, email='jack1@example.com', full_name='One')
+        self.c2 = Candidate.objects.create(campaign=self.campaign, email='jack2@example.com', full_name='Two')
+
+    # ── idempotency: the actual point of this phase ──────────
+    def test_send_outcomes_task_does_not_double_send_on_retry(self):
+        """The specific failure this phase exists to prevent: re-running the
+        same task (a crash + redeliver, or just clicking twice) must not
+        re-email anyone already reached."""
+        from django.core import mail
+        from hiring_app.tasks import send_outcomes_task
+
+        first = send_outcomes_task.delay(str(self.campaign.pk), [self.c1.pk])
+        self.assertEqual(first.get(), {'sent': 2, 'skipped': 0, 'failed': 0})
+        self.assertEqual(len(mail.outbox), 2)
+
+        second = send_outcomes_task.delay(str(self.campaign.pk), [self.c1.pk])
+        self.assertEqual(second.get(), {'sent': 0, 'skipped': 2, 'failed': 0})
+        self.assertEqual(len(mail.outbox), 2)  # unchanged — nothing re-sent
+
+    def test_send_invites_task_does_not_double_send_on_retry(self):
+        from django.core import mail
+        from hiring_app.tasks import send_invites_task
+
+        args = (str(self.campaign.pk), [self.c1.pk, self.c2.pk], 'Hiring Team', '2026-09-01T10:00')
+        first = send_invites_task.delay(*args)
+        self.assertEqual(first.get(), {'sent': 2, 'skipped': 0, 'failed': 0})
+        self.assertEqual(len(mail.outbox), 2)
+
+        second = send_invites_task.delay(*args)
+        self.assertEqual(second.get(), {'sent': 0, 'skipped': 2, 'failed': 0})
+        self.assertEqual(len(mail.outbox), 2)
+
+    def test_send_outcomes_task_marks_campaign_completed(self):
+        from hiring_app.tasks import send_outcomes_task
+        send_outcomes_task.delay(str(self.campaign.pk), [self.c1.pk]).get()
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.campaign.status, 'completed')
+
+    def test_send_outcomes_task_survives_a_deleted_campaign(self):
+        """A redelivered task for a campaign that no longer exists must not
+        raise — there's nothing sensible left to retry."""
+        from hiring_app.tasks import send_outcomes_task
+        fake_id = self.campaign.pk
+        self.campaign.delete()
+        result = send_outcomes_task.delay(str(fake_id), [self.c1.pk])
+        self.assertEqual(result.get(), {'sent': 0, 'skipped': 0, 'failed': 0})
+
+    # ── views enqueue and return, don't send inline ──────────
+    def test_send_outcomes_view_enqueues_and_redirects_with_watch_param(self):
+        self.client.force_login(self.user)
+        resp = self.client.post(
+            f'/campaign/{self.campaign.pk}/outcomes/',
+            {'hired_candidates': [self.c1.email], 'confirm': 'SEND'},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn('?watch=outcomes', resp['Location'])
+
+    def test_send_invites_view_rejects_bad_date_before_enqueueing(self):
+        from django.core import mail
+        self.client.force_login(self.user)
+        resp = self.client.post(
+            f'/campaign/{self.campaign.pk}/invites/',
+            {'selected_candidates': [self.c1.email], 'interview_date': 'not-a-real-date'},
+            follow=True,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(mail.outbox), 0)
+        self.c1.refresh_from_db()
+        self.assertIsNone(self.c1.invite_sent_at)
+
+    # ── status endpoint ───────────────────────────────────────
+    def test_campaign_status_reports_counts(self):
+        from hiring_app.tasks import send_outcomes_task
+        send_outcomes_task.delay(str(self.campaign.pk), [self.c1.pk]).get()
+
+        self.client.force_login(self.user)
+        resp = self.client.get(f'/campaign/{self.campaign.pk}/status/')
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data['total_candidates'], 2)
+        self.assertEqual(data['outcomes_sent'], 2)
+        self.assertEqual(data['status'], 'completed')
+
+    def test_campaign_status_ownership_checked(self):
+        other = User.objects.create_user(username='mallory', password='Str0ng!Passphrase42')
+        self.client.force_login(other)
+        resp = self.client.get(f'/campaign/{self.campaign.pk}/status/')
+        self.assertEqual(resp.status_code, 404)

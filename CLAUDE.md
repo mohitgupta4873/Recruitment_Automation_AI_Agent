@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Django app that automates an end-to-end hiring workflow: generate a JD with Gemini → launch a campaign with its own public apply page (optionally with a Google Sheet for tracking) → candidates apply directly with a resume upload, which is scored against AI-derived keywords for the role → send Google Calendar interview invites → send offer/rejection emails and log outcomes. Google (Sheets export, Gmail send) is optional throughout — every step also works through Django's own email backend when it isn't connected.
+A Django app that automates an end-to-end hiring workflow: generate a JD with Gemini → launch a campaign with its own public apply page (optionally with a Google Sheet for tracking) → candidates apply directly with a resume upload, which is scored against AI-derived keywords for the role → send Google Calendar interview invites → send offer/rejection emails and log outcomes. Google (Sheets export, Gmail send) is optional throughout — every step also works through Django's own email backend when it isn't connected. Invites and outcomes run as background Celery tasks, not inline in the request.
 
 There is effectively one Django app, `hiring_app`, inside the project `my_hiring_project`. Almost all business logic lives in `hiring_app/services.py` (Google/Gemini calls) and `hiring_app/models.py` (persistence). `hiring_app/views.py` is a thin controller layer over both.
 
@@ -21,15 +21,22 @@ pip install -r requirements.txt
 # Run the dev server
 python manage.py runserver
 
+# Run a real Celery worker (optional — only needed to test the actual async
+# path; with no REDIS_URL set locally, .delay() runs eagerly in-process, so
+# `runserver` alone is enough for normal development)
+celery -A my_hiring_project worker --loglevel=info
+
 # DB migrations
 python manage.py makemigrations
 python manage.py migrate
 
 # Run tests — hiring_app/tests.py covers Phase 0 security hardening (method
 # guards, password policy, recipient validation), Phase 1 (ownership,
-# encryption), and Phase 2 (apply-page validation, scoring). File storage
-# under test is redirected to a temp dir (ApplyPageTests) — don't remove that
-# override, or running the suite writes real files under media/resumes/.
+# encryption), Phase 2 (apply-page validation, scoring), and Phase 3
+# (background-task idempotency). File storage under test is redirected to a
+# temp dir (ApplyPageTests) — don't remove that override, or running the
+# suite writes real files under media/resumes/. Celery tasks run eagerly
+# under the test runner (settings.py: `if TESTING`) — no broker needed.
 python manage.py test
 
 # Django's own checks. The --deploy variant is the pre-launch gate and must
@@ -55,7 +62,8 @@ database (see Architecture). Safe to re-run; already-imported campaigns are skip
 ### Deployment (Render/Railway-style)
 
 - `build.sh` runs `pip install`, `collectstatic`, then `migrate` — this is the production build step, not something to run ad hoc in dev.
-- `Procfile` runs gunicorn against `my_hiring_project.wsgi`.
+- `Procfile` runs gunicorn against `my_hiring_project.wsgi`. It does **not** run the Celery worker — that's a separate process (`celery -A my_hiring_project worker`), which `Procfile` alone (single-service) has no way to express.
+- `render.yaml` (added Phase 3) declares both the web service and a worker service, plus managed Postgres and a Key Value (Redis) instance, as an optional Render Blueprint. It's additive — `build.sh`/`Procfile` are untouched and keep working exactly as they do now whether or not this Blueprint is ever adopted. **Not deployed or verified against a real Render account** — written from documentation; review every value before adopting it.
 - Static files are served by WhiteNoise via the `STORAGES['staticfiles']` setting. The manifest backend is used outside DEBUG and outside the test runner (`USE_MANIFEST_STATIC` overrides), so after touching anything in `hiring_app/static/`, `collectstatic` needs to run before it will show up in a production-like run.
 
 ## Architecture
@@ -194,7 +202,7 @@ saved, scored, and permanently unreachable through the UI.
 
 Each user authorizes their own Google account (Sheets/Gmail scopes are defined once in `SCOPES` in `services.py` — narrowed in Phase 2, see above). Credential resolution in `views.py`:
 
-- `_get_user_google_creds(user)` loads the per-user `GoogleOAuthToken` DB row, auto-refreshing and re-saving if expired.
+- `services.get_user_google_creds(user)` (moved out of `views.py` in Phase 3 so `hiring_app/tasks.py` can call it without importing `views.py`, which imports `tasks.py` to enqueue) loads the per-user `GoogleOAuthToken` DB row, auto-refreshing and re-saving if expired.
 - If no DB row exists it returns `None`, and `HiringAutomator` runs in its no-Google mode — Sheets export silently skipped, email sent through Django's backend instead of Gmail (see `HiringAutomator` above). **There is deliberately no fallback to a token file on disk.** The old `token.json` fallback meant any user who had not connected Google silently operated as the deployer — full Drive access and send-as-Gmail on someone else's account. `token.json` and `generate_token.py` have been deleted; do not reintroduce them.
 - `google_disconnect` revokes the grant at Google (`oauth2.googleapis.com/revoke`) before deleting the row, so the app also disappears from the user's Google permissions page.
 
@@ -207,6 +215,55 @@ Uses `django-environ`, reading `.env` in dev and real env vars in production (Re
 Logging goes to **stdout only** in production — the container filesystem is ephemeral, so rotating files were wiped every deploy and invisible to log aggregation, and creating `logs/` at import time crashes on a read-only filesystem. The rotating file handlers still exist under `DEBUG`. The `hiring_app` logger is the one used throughout `views.py`/`services.py`; **never log candidate emails or resume text through it** — that is applicant PII.
 
 A `if not DEBUG:` block sets `SECURE_PROXY_SSL_HEADER`, `SECURE_SSL_REDIRECT` and HSTS. The proxy header is load-bearing, not cosmetic: without it `request.is_secure()` is `False` behind Render's TLS terminator, so `views.py` builds an `http://` OAuth `redirect_uri` that Google rejects, and `SECURE_SSL_REDIRECT` would infinite-loop.
+
+### Background tasks (`hiring_app/tasks.py`, `my_hiring_project/celery.py`)
+
+Interview invites and outcome emails run as Celery tasks (`send_invites_task`,
+`send_outcomes_task`) rather than inline in the request — both used to run
+synchronously against gunicorn's 120s timeout, with no guard against
+re-sending to a candidate who'd already been emailed if a mid-batch crash
+forced a re-run.
+
+Idempotency is **DB-level, not exception-based**: each task re-queries for
+candidates whose `invite_sent_at`/`outcome_sent_at` is still unset immediately
+before running, so re-running the *same* task (a retry, a redelivered message
+after a worker crash, or clicking the button twice) only ever processes
+whoever didn't get through last time. `HiringAutomator.send_invites`/
+`send_outcomes` already wrap each individual candidate's send in its own
+try/except (Phase 0 — one bounced address shouldn't fail the whole batch), so
+a single Google API error never propagates up to Celery as a task failure;
+that's why the tasks don't use `autoretry_for=(HttpError,)` — there's nothing
+at that level to catch. What `acks_late=True` is actually for: if the
+*worker process* dies mid-task (OOM, deploy restart, SIGKILL), the broker
+redelivers the message and the task runs again — combined with the DB-level
+filtering, that redelivery is safe.
+
+Broker/backend reuse `REDIS_URL` — no new required env var; production
+already needs it for the rate-limit cache (Phase 0). Locally, with no
+`REDIS_URL` set, `CELERY_TASK_ALWAYS_EAGER` is on and `.delay()` runs
+synchronously in-process — `manage.py runserver` alone is enough to develop
+against; a real worker is only needed to exercise the actual async path (or
+under the test runner, where eager mode is forced regardless of `REDIS_URL`
+via `TESTING`, so tests never need a real broker).
+
+Views (`send_invites`, `send_outcomes`) enqueue and redirect immediately,
+appending `?watch=invites` or `?watch=outcomes` to the URL. `agent.html`'s JS
+notices that param and polls `GET /campaign/<id>/status/`
+(`views.campaign_status`) every few seconds, updating a progress banner until
+the counts catch up. That status endpoint reports **DB state directly** — how
+many candidates actually have the timestamp set — rather than tracking Celery
+task IDs; the DB is the source of truth either way, and this avoids needing a
+result backend that outlives a single poll or a model field to stash a task
+ID in.
+
+Not yet verified against a real broker: the specific "kill a live worker
+process mid-batch and confirm the redelivered task doesn't double-send" test
+described in ROADMAP.md Phase 3 needs a running Redis + separate worker
+process, which wasn't available in the environment this was built in (no
+Docker daemon running). What *is* verified (`hiring_app/tests.py:
+BackgroundTaskTests`) is that re-invoking a task for work already completed
+is a no-op — the actual idempotency guarantee this phase depends on. Do that
+worker-kill test for real before relying on it under production load.
 
 ### Error reporting to the user
 

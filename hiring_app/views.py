@@ -18,13 +18,12 @@ from django.http import JsonResponse
 from django.views.decorators.http import require_POST, require_http_methods
 from django_ratelimit.decorators import ratelimit
 
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request as GoogleRequest
 from google_auth_oauthlib.flow import Flow
 
-from .services import HiringAutomator, SCOPES, JDGenerationFailed
+from .services import HiringAutomator, SCOPES, JDGenerationFailed, get_user_google_creds
 from .models import GoogleOAuthToken, Campaign, Candidate
 from .forms import ApplicationForm
+from .tasks import send_invites_task, send_outcomes_task
 
 logger = logging.getLogger('hiring_app')
 
@@ -60,38 +59,11 @@ def _build_oauth_flow(request, state=None, code_verifier=None):
     return flow
 
 
-def _get_user_google_creds(user):
-    """
-    Load & auto-refresh Google OAuth credentials for a user from DB.
-    Returns a Credentials object, or None if the user hasn't connected Google
-    (or refresh failed) — HiringAutomator then raises GoogleNotConnected on
-    any Google-backed operation. There is no fallback to a shared token.
-    """
-    try:
-        token_record = GoogleOAuthToken.objects.get(user=user)
-        creds = Credentials.from_authorized_user_info(
-            json.loads(token_record.token_json), SCOPES
-        )
-        # Auto-refresh expired token
-        if creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(GoogleRequest())
-                token_record.token_json = creds.to_json()
-                token_record.save()
-                logger.info(f"Refreshed Google token for user id={user.id}")
-            except Exception as e:
-                logger.error(f"Failed to refresh Google token for user id={user.id}: {e}")
-                return None
-        return creds
-    except GoogleOAuthToken.DoesNotExist:
-        return None
-    except Exception as e:
-        logger.error(f"Error loading Google creds for user id={user.id}: {e}")
-        return None
-
-
 def _automator_for(request):
-    return HiringAutomator(creds=_get_user_google_creds(request.user))
+    # get_user_google_creds moved to services.py in Phase 3 so hiring_app/tasks.py
+    # can use it too, without importing views.py (which imports tasks.py to
+    # enqueue — that way lies a circular import).
+    return HiringAutomator(creds=get_user_google_creds(request.user))
 
 
 def _get_owned_campaign(request, campaign_id):
@@ -203,7 +175,7 @@ def apply(request, public_token):
     if request.method == 'POST':
         form = ApplicationForm(request.POST, request.FILES)
         if form.is_valid():
-            automator = HiringAutomator(creds=_get_user_google_creds(campaign.owner))
+            automator = HiringAutomator(creds=get_user_google_creds(campaign.owner))
             try:
                 automator.process_application(campaign, form.cleaned_data)
                 logger.info(f"New application to campaign={campaign.pk}")
@@ -481,6 +453,13 @@ def create_campaign(request, campaign_id):
 @login_required
 @require_POST
 def send_invites(request, campaign_id):
+    """Enqueue interview invites and return immediately.
+
+    Phase 3: this used to send synchronously, in the request, with no way to
+    survive a crash mid-batch without risking a double-send. Now it hands off
+    to send_invites_task and the agent page polls campaign_status for
+    progress — see agent.html.
+    """
     campaign = _get_owned_campaign(request, campaign_id)
     submitted      = request.POST.getlist('selected_candidates')
     interview_date = request.POST.get('interview_date')
@@ -499,37 +478,32 @@ def send_invites(request, campaign_id):
         messages.error(request, "None of the selected candidates belong to this campaign.")
         return redirect('campaign_agent', campaign_id=campaign.pk)
 
-    automator = _automator_for(request)
+    # Validate the date up front — fail fast in the request, not silently
+    # inside a background task the user has already navigated away from.
     try:
-        results = automator.send_invites(campaign, selected, "Hiring Team", interview_date)
-        failures = [r for r in results if r.startswith('Failed')]
-        logger.info(
-            f"Invites: {len(results) - len(failures)} sent, {len(failures)} failed, "
-            f"user id={request.user.id}"
-        )
-        if failures:
-            messages.warning(
-                request,
-                f"Sent {len(results) - len(failures)} invite(s); {len(failures)} could not be delivered.",
-            )
-        else:
-            messages.success(request, f"Sent {len(results)} interview invite(s).")
+        HiringAutomator(creds=None).parse_interview_datetime(interview_date)
     except ValueError as e:
         messages.error(request, str(e))
-    except Exception:
-        logger.exception(f"Send invites failed for user id={request.user.id}")
-        messages.error(request, "Could not send the invites. Please try again.")
+        return redirect('campaign_agent', campaign_id=campaign.pk)
 
-    return redirect('campaign_agent', campaign_id=campaign.pk)
+    send_invites_task.delay(campaign.pk, [c.pk for c in selected], "Hiring Team", interview_date)
+    logger.info(f"Queued {len(selected)} invite(s) for campaign={campaign.pk}, user id={request.user.id}")
+    messages.success(request, f"Sending {len(selected)} interview invite(s) in the background…")
+    # ?watch=invites tells agent.html's JS to poll campaign_status and update
+    # live rather than leaving the recruiter looking at a static "sending…"
+    # message with no idea whether it's actually progressing.
+    return redirect(reverse('campaign_agent', args=[campaign.pk]) + '?watch=invites')
 
 
 @login_required
 @require_POST
 def send_outcomes(request, campaign_id):
-    """Send offers to the selected candidates and rejections to everyone else.
-
-    This is irreversible, so it requires an explicit confirmation token from the
-    interstitial rather than firing on a single click.
+    """Enqueue offers to the selected candidates and rejections to everyone
+    else. This is irreversible, so it requires an explicit confirmation token
+    from the interstitial rather than firing on a single click — the typed
+    confirmation is the safeguard; enqueueing rather than sending inline
+    (Phase 3) is about not double-sending on a crash mid-batch, a separate
+    concern from this one.
     """
     campaign = _get_owned_campaign(request, campaign_id)
     submitted = request.POST.getlist('hired_candidates')
@@ -557,29 +531,35 @@ def send_outcomes(request, campaign_id):
             'total_count':  total,
         })
 
-    automator = _automator_for(request)
-    try:
-        hired_ids = {c.pk for c in hired}
-        results = automator.send_outcomes(campaign, hired_ids)
-        campaign.status = 'completed'
-        campaign.save(update_fields=['status', 'updated_at'])
-        failures = [r for r in results if r.startswith('FAILED')]
-        logger.info(
-            f"Outcomes: {len(results) - len(failures)} sent, {len(failures)} failed, "
-            f"campaign={campaign.pk}, user id={request.user.id}"
-        )
-        if failures:
-            messages.warning(
-                request,
-                f"Sent {len(results) - len(failures)} outcome email(s); {len(failures)} failed.",
-            )
-        else:
-            messages.success(request, f"Sent {len(results)} outcome email(s).")
-    except Exception:
-        logger.exception(f"Send outcomes failed for user id={request.user.id}")
-        messages.error(request, "Could not send the outcome emails. Please try again.")
+    hired_ids = [c.pk for c in hired]
+    send_outcomes_task.delay(campaign.pk, hired_ids)
+    logger.info(
+        f"Queued outcomes for {total} candidate(s), campaign={campaign.pk}, "
+        f"user id={request.user.id}"
+    )
+    messages.success(request, f"Sending {total} outcome email(s) in the background…")
+    return redirect(reverse('campaign_agent', args=[campaign.pk]) + '?watch=outcomes')
 
-    return redirect('campaign_agent', campaign_id=campaign.pk)
+
+@login_required
+def campaign_status(request, campaign_id):
+    """Polled from agent.html while invites/outcomes are sending in the
+    background. Reports DB state directly — how many candidates actually have
+    invite_sent_at/outcome_sent_at set — rather than tracking Celery task IDs.
+    The DB is the source of truth either way, and this sidesteps needing a
+    result backend that outlives a single poll (or a model field to stash a
+    task ID in) for something the row itself already answers.
+    """
+    campaign = _get_owned_campaign(request, campaign_id)
+    total = campaign.candidates.count()
+    invited = campaign.candidates.exclude(invite_sent_at__isnull=True).count()
+    outcomes_sent = campaign.candidates.exclude(outcome_sent_at__isnull=True).count()
+    return JsonResponse({
+        'status': campaign.status,
+        'total_candidates': total,
+        'invites_sent': invited,
+        'outcomes_sent': outcomes_sent,
+    })
 
 
 # ─────────────────────────────────────────────────────────────

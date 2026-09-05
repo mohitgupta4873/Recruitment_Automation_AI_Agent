@@ -184,6 +184,36 @@ else:
         'without a shared cache, and login/register would be effectively open.'
     )
 
+# ── Celery (background tasks — Phase 3) ─────────────────────────
+# Interview invites and outcome emails run here instead of inline in the
+# request: both used to run synchronously against gunicorn's 120s timeout,
+# with no way to survive a crash mid-batch without risking a double-send.
+#
+# Reuses REDIS_URL rather than adding a new required env var — same instance
+# django-ratelimit's cache already needs outside DEBUG. In local dev with no
+# REDIS_URL (and not under the test runner), tasks run eagerly in-process —
+# .delay() behaves like a normal function call, no worker required — so
+# `manage.py runserver` alone is still enough to develop against. Tests always
+# run eagerly regardless of REDIS_URL, so they never need a real broker.
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 20 * 60         # hard kill
+CELERY_TASK_SOFT_TIME_LIMIT = 15 * 60    # raises SoftTimeLimitExceeded first
+
+if REDIS_URL:
+    CELERY_BROKER_URL = REDIS_URL
+    CELERY_RESULT_BACKEND = REDIS_URL
+    CELERY_TASK_ALWAYS_EAGER = False
+else:
+    CELERY_TASK_ALWAYS_EAGER = True
+    CELERY_TASK_EAGER_PROPAGATES = True
+
+if TESTING:
+    CELERY_TASK_ALWAYS_EAGER = True
+    CELERY_TASK_EAGER_PROPAGATES = True
+
 # ── Password validation ───────────────────────────────────────
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},

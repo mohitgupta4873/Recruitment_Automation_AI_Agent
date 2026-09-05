@@ -19,6 +19,11 @@ psycopg2-binary==2.9.12
 django-ratelimit==4.1.0
 redis==5.0.4
 
+# ── Background tasks (Phase 3) ─────────────────────────────────
+# Interview invites and outcome emails run here instead of inline in the
+# request. Broker/backend reuse REDIS_URL above — see celery.py.
+celery==5.4.0
+
 # ── Field-level encryption (GoogleOAuthToken.token_json) ──────
 # Was previously only a transitive dep of google-auth; now imported directly
 # by hiring_app/models.py, so it's pinned explicitly.

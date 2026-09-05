@@ -108,6 +108,12 @@ python manage.py runserver
 
 Visit http://127.0.0.1:8000/, register an account, and start a campaign. Connecting Google is optional and can be done later from the dashboard ("Connect Google") — it unlocks Sheets export and sending email as your own Gmail address instead of the app's default sender.
 
+Interview invites and outcome emails run as background tasks (Celery). With no `REDIS_URL` set, they run synchronously in-process instead — `runserver` alone is enough for normal local development. To actually exercise the background path, set `REDIS_URL` in `.env` and run a worker alongside the server:
+
+```bash
+celery -A my_hiring_project worker --loglevel=info
+```
+
 6. (Optional) Google OAuth for local development
 
 If you want to test the Google integration locally: download OAuth 2.0 Client credentials from Google Cloud Console as `client_secrets.json` and place it in the repo root (this is read automatically when `GOOGLE_CLIENT_SECRETS` isn't set in `.env`). No separate token-generation script is needed — connecting happens through the app's own "Connect Google" button, per user.
@@ -129,4 +135,4 @@ python manage.py test
 
 📍 Status
 
-This app has been through several rounds of production-readiness hardening (moving campaign data into Postgres, replacing the Google Form with a self-hosted application page, narrowing Google OAuth scopes). It's not yet running background jobs for long operations (interview invites and outcome emails are still sent synchronously), so very large candidate pools should be sent in smaller batches for now.
+This app has been through several rounds of production-readiness hardening (moving campaign data into Postgres, replacing the Google Form with a self-hosted application page, narrowing Google OAuth scopes, moving interview invites and outcome emails to a background task queue). Not yet in place: a privacy policy, a data retention policy, and account/candidate deletion — all real requirements given the app handles resumes belonging to people who aren't its users.

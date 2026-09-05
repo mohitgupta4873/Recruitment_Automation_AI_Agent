@@ -141,6 +141,17 @@
         </div>
       </div>
 
+      <!-- Background send progress — shown by JS when ?watch=invites|outcomes
+           is present (see views.send_invites/send_outcomes), polling
+           campaign_status. Hidden by default; nothing renders here on a
+           plain page load. -->
+      <div id="send-progress-banner" class="campaign-banner animate-fade-up mb-3" style="display:none; border-left:3px solid #f59e0b;">
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="badge badge-amber"><span class="dot"></span> Sending</span>
+          <span class="campaign-banner-text" id="send-progress-text">Sending…</span>
+        </div>
+      </div>
+
       <!-- Active campaign banner -->
       {% if campaign.status == 'active' %}
       <div class="campaign-banner animate-fade-up mb-3">
@@ -366,5 +377,55 @@
       else btn.textContent = '⏳ Processing…';
     });
   });
+
+  // ── Background send progress ─────────────────────────────
+  // send_invites/send_outcomes now enqueue a Celery task and redirect
+  // immediately (Phase 3) — this polls campaign_status so the recruiter sees
+  // it actually progressing instead of a static "sending…" message with no
+  // way to tell running from stuck.
+  (function () {
+    const watching = new URLSearchParams(window.location.search).get('watch');
+    if (!watching) return;
+
+    const banner = document.getElementById('send-progress-banner');
+    const text = document.getElementById('send-progress-text');
+    banner.style.display = '';
+
+    const statusUrl = "{% url 'campaign_status' campaign_id %}";
+    const countField = watching === 'outcomes' ? 'outcomes_sent' : 'invites_sent';
+    const label = watching === 'outcomes' ? 'outcome email(s)' : 'invite(s)';
+
+    let polls = 0;
+    const maxPolls = 40; // ~2 minutes at 3s intervals
+
+    function stopWatching(finalText) {
+      text.textContent = finalText;
+      setTimeout(function () {
+        // Reload without ?watch= so a manual refresh doesn't restart polling.
+        window.location.href = window.location.pathname;
+      }, 1200);
+    }
+
+    function poll() {
+      polls += 1;
+      fetch(statusUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          const sent = data[countField];
+          const total = data.total_candidates;
+          text.textContent = `Sent ${sent} of ${total} ${label}…`;
+          if (sent >= total || polls >= maxPolls) {
+            stopWatching(sent >= total ? `Done — sent ${sent} of ${total} ${label}.` : text.textContent);
+            return;
+          }
+          setTimeout(poll, 3000);
+        })
+        .catch(function () {
+          if (polls < maxPolls) setTimeout(poll, 3000);
+        });
+    }
+
+    poll();
+  })();
 </script>
 {% endblock %}

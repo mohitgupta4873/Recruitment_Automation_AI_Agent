@@ -82,4 +82,7 @@ urlpatterns = _password_urls + [
     path('campaign/<uuid:campaign_id>/create/', views.create_campaign, name='create_campaign'),
     path('campaign/<uuid:campaign_id>/invites/', views.send_invites, name='send_invites'),
     path('campaign/<uuid:campaign_id>/outcomes/', views.send_outcomes, name='send_outcomes'),
+    # Polled by agent.html while an invites/outcomes task is running in the
+    # background — see views.campaign_status.
+    path('campaign/<uuid:campaign_id>/status/', views.campaign_status, name='campaign_status'),
 ]

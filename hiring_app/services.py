@@ -13,6 +13,8 @@ from django.core.mail import EmailMessage, send_mail
 from django.utils import timezone
 
 # Google Libraries
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleRequest
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from pypdf import PdfReader
@@ -43,6 +45,42 @@ MAX_RESUME_BYTES = 5 * 1024 * 1024   # 5 MB
 # campaign predates it (imported by import_legacy_campaigns). Not tied to any
 # particular role; better than scoring 0 across the board.
 FALLBACK_KEYWORDS = ["python", "django", "api", "sql", "rest", "docker", "java", "node", "aws"]
+
+
+def get_user_google_creds(user):
+    """
+    Load & auto-refresh Google OAuth credentials for a user from DB.
+    Returns a Credentials object, or None if the user hasn't connected Google
+    (or refresh failed) — HiringAutomator then runs in its no-Google mode.
+    There is no fallback to a shared token.
+
+    Moved here from views.py in Phase 3 so hiring_app/tasks.py can use it too,
+    without importing views.py (which imports tasks.py to enqueue — that way
+    lies a circular import).
+    """
+    from .models import GoogleOAuthToken  # local import: models.py doesn't import services.py, but keep this lazy to avoid any app-loading-order surprises
+
+    try:
+        token_record = GoogleOAuthToken.objects.get(user=user)
+        creds = Credentials.from_authorized_user_info(
+            json.loads(token_record.token_json), SCOPES
+        )
+        # Auto-refresh expired token
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(GoogleRequest())
+                token_record.token_json = creds.to_json()
+                token_record.save()
+                logger.info(f"Refreshed Google token for user id={user.id}")
+            except Exception as e:
+                logger.error(f"Failed to refresh Google token for user id={user.id}: {e}")
+                return None
+        return creds
+    except GoogleOAuthToken.DoesNotExist:
+        return None
+    except Exception as e:
+        logger.error(f"Error loading Google creds for user id={user.id}: {e}")
+        return None
 
 
 class ResumeTooLarge(Exception):
@@ -209,7 +247,7 @@ Respond with ONLY a JSON array of lowercase strings, nothing else. Example:
         """
         role = campaign.role
         results = []
-        dt_start = self._parse_interview_datetime(interview_date)
+        dt_start = self.parse_interview_datetime(interview_date)
         sender_email = self._sender_email()
 
         for i, candidate in enumerate(candidates):
@@ -235,15 +273,20 @@ Respond with ONLY a JSON array of lowercase strings, nothing else. Example:
         return results
 
     # --- OUTCOMES ---
-    def send_outcomes(self, campaign, hired_candidate_ids):
+    def send_outcomes(self, campaign, candidates, hired_candidate_ids):
         """Send an offer to every candidate in `hired_candidate_ids` (a set of
-        Candidate pks) and a rejection to every other candidate in `campaign`.
+        Candidate pks) and a rejection to everyone else in `candidates`.
+
+        `candidates` — not `campaign.candidates.all()` — is the caller's job to
+        supply (Phase 3: hiring_app.tasks.send_outcomes_task passes only
+        candidates with outcome_sent_at unset, so a retried task doesn't
+        re-email anyone the previous attempt already reached).
         """
         role = campaign.role
         results = []
         sender_email = self._sender_email()
 
-        for candidate in campaign.candidates.all():
+        for candidate in candidates:
             greeting = f"Hi {candidate.full_name}," if candidate.full_name else "Hi,"
             if candidate.pk in hired_candidate_ids:
                 subject = f"Offer: {role}"
@@ -270,7 +313,7 @@ Respond with ONLY a JSON array of lowercase strings, nothing else. Example:
         return results
 
     # --- HELPERS ---
-    def _parse_interview_datetime(self, value):
+    def parse_interview_datetime(self, value):
         """Parse the <input type="datetime-local"> value into an aware datetime.
 
         strptime produces a naive datetime, and .astimezone() on a naive value

@@ -36,7 +36,8 @@ services:
           name: hireai-redis
           property: connectionString
       # SECRET_KEY, FIELD_ENCRYPTION_KEY, GEMINI_API_KEY, GOOGLE_CLIENT_SECRETS,
-      # ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS, EMAIL_* — set these as secrets in
+      # LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET, ALLOWED_HOSTS,
+      # CSRF_TRUSTED_ORIGINS, EMAIL_* — set these as secrets in
       # the Render dashboard, not here. See .env.example for the full list and
       # what's required vs optional.
 

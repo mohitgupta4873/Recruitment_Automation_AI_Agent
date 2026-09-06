@@ -66,6 +66,16 @@ urlpatterns = _password_urls + [
     path('google/oauth2callback/', views.google_oauth_callback, name='google_oauth_callback'),
     path('google/disconnect/', views.google_disconnect, name='google_disconnect'),
 
+    # LinkedIn OAuth — separate provider/flow, optional "post JD to LinkedIn"
+    # checkbox at campaign launch. Independent of the Google connection above.
+    path('linkedin/connect/', views.linkedin_connect, name='linkedin_connect'),
+    path('linkedin/oauth2callback/', views.linkedin_oauth_callback, name='linkedin_oauth_callback'),
+    path('linkedin/disconnect/', views.linkedin_disconnect, name='linkedin_disconnect'),
+    # Manual alternative to the OAuth flow above — paste a token generated
+    # by hand from LinkedIn's Developer Portal instead of going through
+    # linkedin_connect's redirect. See views.linkedin_connect_manual.
+    path('linkedin/connect-manual/', views.linkedin_connect_manual, name='linkedin_connect_manual'),
+
     # Dashboard & Multi-Campaign
     path('dashboard/', views.dashboard_overview, name='dashboard'),
     path('campaign/new/', views.new_campaign, name='new_campaign'),

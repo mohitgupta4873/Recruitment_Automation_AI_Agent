@@ -8,6 +8,8 @@ from dateutil import tz
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import requests
+
 from django.core.files.base import ContentFile
 from django.core.mail import EmailMessage, send_mail
 from django.utils import timezone
@@ -34,6 +36,18 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/gmail.send",
 ]
+
+# LinkedIn scopes for the optional "post this JD to LinkedIn" checkbox at
+# campaign launch (see HiringAutomator.create_campaign / post_jd_to_linkedin
+# below). openid+profile (from the self-serve "Sign In with LinkedIn using
+# OpenID Connect" product) resolve the connecting user's member URN;
+# w_member_social (from the "Share on LinkedIn" product) is what actually
+# authorizes posting to their feed.
+LINKEDIN_SCOPES = "openid profile w_member_social"
+LINKEDIN_AUTHORIZATION_URL = "https://www.linkedin.com/oauth/v2/authorization"
+LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
+LINKEDIN_USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
+LINKEDIN_UGC_POSTS_URL = "https://api.linkedin.com/v2/ugcPosts"
 
 # Applicant-uploaded resumes are untrusted input. ApplicationForm.clean_resume
 # rejects anything over this before it reaches the ORM; kept here too since
@@ -83,6 +97,34 @@ def get_user_google_creds(user):
         return None
 
 
+def get_user_linkedin_creds(user):
+    """
+    Load LinkedIn OAuth credentials for a user from DB, or None if they
+    haven't connected LinkedIn — or their connection has expired.
+
+    Unlike Google, there's no refresh here: the scopes this app requests
+    don't grant a refresh token, so an expired access token just means
+    "reconnect via linkedin_connect," the same UX as a completely absent
+    connection. HiringAutomator.has_linkedin reflects only a currently-valid
+    connection, and there is no fallback to a shared/deployer credential.
+    """
+    from .models import LinkedInOAuthToken  # local import, same reasoning as get_user_google_creds
+
+    try:
+        token_record = LinkedInOAuthToken.objects.get(user=user)
+        data = json.loads(token_record.token_json)
+        if data.get('expires_at', 0) <= timezone.now().timestamp():
+            return None
+        if not data.get('access_token') or not data.get('member_urn'):
+            return None
+        return data
+    except LinkedInOAuthToken.DoesNotExist:
+        return None
+    except Exception as e:
+        logger.error(f"Error loading LinkedIn creds for user id={user.id}: {e}")
+        return None
+
+
 class ResumeTooLarge(Exception):
     """Raised when a candidate's resume exceeds MAX_RESUME_BYTES."""
 
@@ -102,12 +144,15 @@ class HiringAutomator:
     history — Forms and Drive integration were removed entirely this phase.
 
     Constructed per-request with the *current user's* Google credentials, or
-    None. It's not a singleton and holds no cross-request state of its own.
+    None, plus (optionally) their LinkedIn credentials for the "post this JD
+    to LinkedIn" checkbox at launch — see post_jd_to_linkedin below. It's not
+    a singleton and holds no cross-request state of its own.
     """
 
-    def __init__(self, creds=None):
+    def __init__(self, creds=None, linkedin_creds=None):
         self.creds = creds
         self.sheets = self.gmail = None
+        self.linkedin_creds = linkedin_creds
 
         if self.creds:
             try:
@@ -120,6 +165,10 @@ class HiringAutomator:
     @property
     def has_google(self):
         return self.creds is not None and self.gmail is not None
+
+    @property
+    def has_linkedin(self):
+        return self.linkedin_creds is not None
 
     # --- JD GENERATION ---
     def generate_jd(self, role_title, experience):
@@ -169,7 +218,7 @@ Respond with ONLY a JSON array of lowercase strings, nothing else. Example:
         return list(FALLBACK_KEYWORDS)
 
     # --- CAMPAIGN CREATION ---
-    def create_campaign(self, campaign, jd_text):
+    def create_campaign(self, campaign, jd_text, post_to_linkedin=False, apply_url=None):
         """Finalise `campaign`: store the JD, derive scoring keywords, go live.
 
         `campaign` is an already-saved Campaign row (owner/role already set,
@@ -177,12 +226,24 @@ Respond with ONLY a JSON array of lowercase strings, nothing else. Example:
         saves it in place. Google is entirely optional here — if connected, a
         tracking Sheet is created best-effort; if not, the campaign still
         launches and is fully usable through the apply page alone.
+
+        post_to_linkedin is an explicit opt-in per launch, not implied by
+        having a LinkedIn connection — a recruiter connecting once shouldn't
+        mean every future campaign gets posted without asking again. Silently
+        ignored (not an error) if True but self.has_linkedin is False, since
+        the view only shows the checkbox when a connection exists; treat it
+        the same as Sheets export — best-effort, never a launch blocker.
         """
         campaign.jd_text = jd_text
         campaign.scoring_keywords = self.generate_scoring_keywords(campaign.role, jd_text)
         campaign.status = 'active'
 
-        if self.has_google:
+        # Guarded on sheet_id already being set — without it, re-launching an
+        # already-active campaign (e.g. re-submitting the JD editor to fix a
+        # typo, or regenerating scoring keywords) would create a brand new
+        # Sheet every single call, silently orphaning the previous one with
+        # no link left to it anywhere in the UI.
+        if self.has_google and not campaign.sheet_id:
             try:
                 ss = self.sheets.spreadsheets().create(
                     body={"properties": {"title": f"Applications — {campaign.role}"}}
@@ -195,8 +256,56 @@ Respond with ONLY a JSON array of lowercase strings, nothing else. Example:
                 # Sheet export is a nice-to-have, not a launch blocker.
                 logger.warning(f"Could not create tracking sheet for campaign={campaign.pk}: {e}")
 
+        if post_to_linkedin and self.has_linkedin:
+            self.post_jd_to_linkedin(campaign, jd_text, apply_url)
+
         campaign.save()
         return campaign
+
+    def post_jd_to_linkedin(self, campaign, jd_text, apply_url):
+        """Share `jd_text` as a post on the connected user's LinkedIn feed via
+        the UGC Posts API. Best-effort like the Sheets export above: never
+        raises, and a failure here never blocks (or un-launches) a campaign —
+        it just means `campaign.linkedin_post_id` stays blank.
+
+        Sets campaign.linkedin_post_id on success but does NOT save() —
+        create_campaign's own save() covers it, matching how sheet_id/
+        sheet_url are set above.
+        """
+        commentary = jd_text.strip()[:1200]
+        if apply_url:
+            commentary = f"{commentary}\n\nApply here: {apply_url}"
+
+        body = {
+            "author": self.linkedin_creds["member_urn"],
+            "lifecycleState": "PUBLISHED",
+            "specificContent": {
+                "com.linkedin.ugc.ShareContent": {
+                    "shareCommentary": {"text": commentary},
+                    "shareMediaCategory": "NONE",
+                }
+            },
+            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
+        }
+        try:
+            resp = requests.post(
+                LINKEDIN_UGC_POSTS_URL,
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {self.linkedin_creds['access_token']}",
+                    "Content-Type": "application/json",
+                    "X-Restli-Protocol-Version": "2.0.0",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            post_id = resp.headers.get("x-restli-id") or resp.json().get("id", "")
+            campaign.linkedin_post_id = post_id
+            logger.info(f"Posted campaign={campaign.pk} JD to LinkedIn (post={post_id})")
+            return True
+        except requests.RequestException as e:
+            logger.warning(f"Could not post campaign={campaign.pk} JD to LinkedIn: {e}")
+            return False
 
     # --- APPLICATIONS (replaces Phase 1's sync_responses — see CLAUDE.md) ---
     def process_application(self, campaign, cleaned_data):

@@ -1,0 +1,39 @@
+{% extends 'hiring_app/base.html' %}
+
+{% block title %}Connect LinkedIn — HireAI{% endblock %}
+
+{% block content %}
+<div class="auth-page">
+  <div class="auth-card" style="max-width:520px;">
+
+    <div class="auth-logo">
+      <div class="auth-logo-icon">🔗</div>
+      <span class="auth-logo-text">Connect LinkedIn</span>
+    </div>
+    <p class="auth-subheading">
+      Optional — lets you post a campaign's job description straight to your
+      own LinkedIn feed when you launch it.
+    </p>
+
+    {% if error %}
+    <div class="auth-error">⚠️ {{ error }}</div>
+    {% endif %}
+
+    <div class="form-group" style="font-size:0.82rem; color:var(--text-muted); line-height:1.6;">
+      This only grants permission to read your basic profile (to know who's
+      posting) and to publish posts on your behalf — never to read your
+      connections, messages, or anything else on LinkedIn. You can disconnect
+      at any time from the campaign launch step.
+    </div>
+
+    <a href="{% url 'linkedin_connect' %}" class="btn btn-primary btn-full">
+      Connect with LinkedIn
+    </a>
+
+    <p class="auth-footer">
+      <a href="{% url 'agent' %}">Back to your campaign</a>
+    </p>
+
+  </div>
+</div>
+{% endblock %}

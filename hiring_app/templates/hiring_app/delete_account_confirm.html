@@ -15,8 +15,9 @@
       <span>
         This will delete <strong>{{ campaign_count }}</strong> campaign{{ campaign_count|pluralize }}
         and <strong>{{ candidate_count }}</strong> candidate application{{ candidate_count|pluralize }}
-        (including every stored resume file){% if has_google %}, and disconnect and revoke
-        your connected Google account{% endif %}.
+        (including every stored resume file){% if has_google %}, disconnect and revoke
+        your connected Google account{% endif %}{% if has_linkedin %}, and disconnect your
+        connected LinkedIn account{% endif %}.
       </span>
     </div>
 

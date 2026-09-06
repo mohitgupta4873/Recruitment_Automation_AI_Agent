@@ -65,6 +65,32 @@ class GoogleOAuthToken(models.Model):
         return f"GoogleOAuthToken({self.user.username})"
 
 
+class LinkedInOAuthToken(models.Model):
+    """
+    Per-user LinkedIn OAuth2 credentials, for the optional "post this JD to
+    LinkedIn" checkbox at campaign launch (see HiringAutomator.create_campaign
+    in services.py). Mirrors GoogleOAuthToken: one row per user, encrypted at
+    rest, no shared/fallback credential — a user who hasn't connected LinkedIn
+    just doesn't see the checkbox, the same way a user without Google doesn't
+    see Sheets export.
+
+    token_json holds {"access_token", "expires_at", "member_urn"}. Unlike
+    Google, the scopes this app requests (openid, profile, w_member_social)
+    don't grant a refresh token — LinkedIn access tokens under these products
+    are bearer tokens valid for a fixed window (~60 days) with nothing to
+    refresh them with. get_user_linkedin_creds (services.py) treats an
+    expired token as "not connected" rather than erroring; the fix is just
+    reconnecting via linkedin_connect, same as any other expired login.
+    """
+    user       = models.OneToOneField(User, on_delete=models.CASCADE, related_name='linkedin_token')
+    token_json = EncryptedTextField(help_text="LinkedIn OAuth2 access token + member URN, JSON, encrypted at rest")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"LinkedInOAuthToken({self.user.username})"
+
+
 def _generate_public_token():
     # 22 url-safe chars (~131 bits) — unguessable enough that "does this token
     # resolve to a campaign" is itself a meaningful authorization check; the
@@ -145,6 +171,19 @@ class Campaign(models.Model):
     @property
     def accepting_applications(self):
         return self.status == 'active'
+
+    @property
+    def linkedin_post_url(self):
+        """A shareable link to the LinkedIn post this campaign's JD was
+        cross-posted to (see HiringAutomator.post_jd_to_linkedin), or '' if
+        it was never posted. LinkedIn's feed-update URL just wants the post's
+        URN, URL-encoded, in the path — no separate "get post URL" API call
+        needed for a post this app made a moment ago.
+        """
+        if not self.linkedin_post_id:
+            return ''
+        from urllib.parse import quote
+        return f"https://www.linkedin.com/feed/update/{quote(self.linkedin_post_id, safe='')}/"
 
 
 def candidate_resume_path(instance, filename):

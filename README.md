@@ -24,7 +24,7 @@ Edit: The recruiter can tweak the JD before finalizing.
 
 2. Campaign Launch 🚀
 
-One-Click Deployment: Launching a campaign generates a public application link (`/apply/<token>/`) hosted by the app itself — no Google Form involved. If the recruiter has connected Google, a tracking Sheet is also created automatically (optional).
+One-Click Deployment: Launching a campaign generates a public application link (`/apply/<token>/`) hosted by the app itself — no Google Form involved. If the recruiter has connected Google, a tracking Sheet is also created automatically (optional). If the recruiter has connected LinkedIn, an optional checkbox at launch also posts the JD straight to their own LinkedIn feed.
 
 Scoring setup: Gemini reads the final JD and derives a short list of role-relevant skills/keywords, used to score every applicant automatically.
 
@@ -63,6 +63,8 @@ AI Model: Google Gemini (`gemini-2.5-flash-lite`) — JD drafting and scoring-ke
 Auth: Django's own accounts (username/password, password reset via email) — Google is a separate, optional per-user connection
 
 Optional Google integration: Sheets API (campaign export) and Gmail API (sending as the recruiter), via per-user OAuth 2.0 — encrypted at rest, never required to use the app
+
+Optional LinkedIn integration: post a campaign's JD to the recruiter's own LinkedIn feed at launch time, via per-user OAuth 2.0 — same encrypted-at-rest, never-required pattern as Google
 
 Rate limiting: `django-ratelimit`, backed by Redis in production
 
@@ -117,6 +119,10 @@ celery -A my_hiring_project worker --loglevel=info
 6. (Optional) Google OAuth for local development
 
 If you want to test the Google integration locally: download OAuth 2.0 Client credentials from Google Cloud Console as `client_secrets.json` and place it in the repo root (this is read automatically when `GOOGLE_CLIENT_SECRETS` isn't set in `.env`). No separate token-generation script is needed — connecting happens through the app's own "Connect Google" button, per user.
+
+7. (Optional) LinkedIn OAuth for local development
+
+If you want to test the LinkedIn cross-post feature: create an app at [LinkedIn Developers](https://www.linkedin.com/developers/apps), enable the "Sign In with LinkedIn using OpenID Connect" and "Share on LinkedIn" products, add `http://127.0.0.1:8000/linkedin/oauth2callback/` as a redirect URL, and set `LINKEDIN_CLIENT_ID`/`LINKEDIN_CLIENT_SECRET` in `.env`. Leave both blank to skip — the feature is simply absent, not broken, without them.
 
 🔒 Security
 

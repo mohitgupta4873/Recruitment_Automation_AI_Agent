@@ -263,6 +263,18 @@ GEMINI_API_KEY = env('GEMINI_API_KEY', default='')
 GOOGLE_CLIENT_SECRETS = env('GOOGLE_CLIENT_SECRETS', default='')  # JSON string in prod
 ADMIN_EMAIL = env('ADMIN_EMAIL', default='')  # for error emails
 
+# ── LinkedIn OAuth (optional "post this JD to LinkedIn" feature) ──────
+# From a LinkedIn Developer app (https://www.linkedin.com/developers/apps).
+# Needs the "Sign In with LinkedIn using OpenID Connect" product (self-serve)
+# for openid/profile, plus "Share on LinkedIn" for w_member_social — verify
+# that product is actually granted to your app before relying on posting to
+# work; LinkedIn's review requirements for it have changed over time and
+# weren't re-verified when this was written. Blank disables the feature
+# entirely: linkedin_connect renders a "not configured" message instead of
+# erroring, the same way an unset GOOGLE_CLIENT_SECRETS does for Google.
+LINKEDIN_CLIENT_ID = env('LINKEDIN_CLIENT_ID', default='')
+LINKEDIN_CLIENT_SECRET = env('LINKEDIN_CLIENT_SECRET', default='')
+
 # ── Admins (get 500 error emails) ─────────────────────────────
 if ADMIN_EMAIL:
     ADMINS = [('Admin', ADMIN_EMAIL)]
@@ -282,14 +294,26 @@ PRIVACY_CONTACT_EMAIL = env('PRIVACY_CONTACT_EMAIL', default=ADMIN_EMAIL or 'pri
 # longer optional: without it a locked-out user has no recovery path.
 DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', default='HireAI <no-reply@hireai.app>')
 
+# Read regardless of DEBUG, unlike before — so a developer can opt into real
+# delivery locally by setting EMAIL_HOST in .env, without flipping DEBUG=False
+# (which would also demand REDIS_URL/FIELD_ENCRYPTION_KEY and would break
+# plain-HTTP `runserver` access outright via the SECURE_SSL_REDIRECT below —
+# far too heavy just to test that an invite email actually sends).
+EMAIL_HOST = env('EMAIL_HOST', default='')
+EMAIL_PORT = env.int('EMAIL_PORT', default=587)
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = env('EMAIL_HOST_USER', default='')
+EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', default='')
+
 if not DEBUG:
     EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-    EMAIL_HOST = env('EMAIL_HOST', default='')
-    EMAIL_PORT = env.int('EMAIL_PORT', default=587)
-    EMAIL_USE_TLS = True
-    EMAIL_HOST_USER = env('EMAIL_HOST_USER', default='')
-    EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', default='')
     SERVER_EMAIL = env('SERVER_EMAIL', default=DEFAULT_FROM_EMAIL)
+elif EMAIL_HOST:
+    # Explicit local opt-in: EMAIL_HOST is set even though DEBUG is on, so
+    # use it for real sends instead of the console. The common DEBUG=True
+    # case (EMAIL_HOST unset) still defaults to console below — nobody gets
+    # switched to real delivery by accident.
+    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 else:
     EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 

@@ -2,6 +2,7 @@
 Phase 0 (security hardening) + Phase 1 (Postgres-backed campaigns) +
 Phase 2 (public apply page) verification.
 """
+import json
 import os
 import shutil
 import tempfile
@@ -800,3 +801,560 @@ class AccountDeletionTests(TestCase):
 
         self.assertTrue(User.objects.filter(pk=other.pk).exists())
         self.assertTrue(Campaign.objects.filter(pk=other_campaign.pk).exists())
+
+
+class LinkedInCredsTests(TestCase):
+    """get_user_linkedin_creds / HiringAutomator.has_linkedin — the same
+    "optional, per-user, no shared fallback" shape as Google, minus the
+    refresh-token dance LinkedIn's scopes don't grant."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='sam', password='Str0ng!Passphrase42')
+
+    def _make_token(self, expires_in_seconds):
+        from django.utils import timezone
+        from hiring_app.models import LinkedInOAuthToken
+        LinkedInOAuthToken.objects.create(
+            user=self.user,
+            token_json=json.dumps({
+                'access_token': 'tok-123',
+                'member_urn': 'urn:li:person:abc',
+                'expires_at': timezone.now().timestamp() + expires_in_seconds,
+            }),
+        )
+
+    def test_no_token_returns_none(self):
+        from hiring_app.services import get_user_linkedin_creds
+        self.assertIsNone(get_user_linkedin_creds(self.user))
+
+    def test_valid_token_returns_creds_dict(self):
+        from hiring_app.services import get_user_linkedin_creds
+        self._make_token(expires_in_seconds=3600)
+        creds = get_user_linkedin_creds(self.user)
+        self.assertEqual(creds['access_token'], 'tok-123')
+        self.assertEqual(creds['member_urn'], 'urn:li:person:abc')
+
+    def test_expired_token_returns_none(self):
+        """No refresh token under these scopes — expired just means
+        'reconnect', same as never having connected at all."""
+        from hiring_app.services import get_user_linkedin_creds
+        self._make_token(expires_in_seconds=-3600)
+        self.assertIsNone(get_user_linkedin_creds(self.user))
+
+    def test_token_json_is_encrypted_in_the_database(self):
+        from django.db import connection
+        self._make_token(expires_in_seconds=3600)
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT token_json FROM hiring_app_linkedinoauthtoken WHERE user_id = %s",
+                [self.user.id],
+            )
+            raw = cur.fetchone()[0]
+        self.assertNotIn('tok-123', raw)  # ciphertext, not plaintext
+
+    def test_automator_has_linkedin_reflects_creds(self):
+        from hiring_app.services import HiringAutomator
+        self.assertFalse(HiringAutomator(linkedin_creds=None).has_linkedin)
+        self.assertTrue(HiringAutomator(linkedin_creds={'access_token': 'x', 'member_urn': 'y'}).has_linkedin)
+
+
+class LinkedInPostingTests(TestCase):
+    """HiringAutomator.post_jd_to_linkedin / create_campaign's opt-in
+    cross-post — best-effort like Sheets export, never blocks a launch."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='tara', password='Str0ng!Passphrase42')
+        self.campaign = Campaign.objects.create(owner=self.user, role='Recruiter', status='draft')
+        self.creds = {'access_token': 'tok-abc', 'member_urn': 'urn:li:person:xyz'}
+
+    def test_post_success_sets_linkedin_post_id(self):
+        from unittest.mock import patch, MagicMock
+        from hiring_app.services import HiringAutomator
+
+        mock_resp = MagicMock(status_code=201, headers={'x-restli-id': 'urn:li:share:999'})
+        mock_resp.raise_for_status.return_value = None
+        with patch('hiring_app.services.requests.post', return_value=mock_resp) as mock_post:
+            automator = HiringAutomator(linkedin_creds=self.creds)
+            ok = automator.post_jd_to_linkedin(self.campaign, 'A great job description.', 'https://example.com/apply/x/')
+            self.assertTrue(ok)
+            mock_post.assert_called_once()
+        self.assertEqual(self.campaign.linkedin_post_id, 'urn:li:share:999')
+
+    def test_post_failure_never_raises_and_leaves_post_id_blank(self):
+        from unittest.mock import patch
+        import requests as requests_module
+        from hiring_app.services import HiringAutomator
+
+        with patch('hiring_app.services.requests.post', side_effect=requests_module.RequestException('boom')):
+            automator = HiringAutomator(linkedin_creds=self.creds)
+            ok = automator.post_jd_to_linkedin(self.campaign, 'JD text', 'https://example.com/apply/x/')
+        self.assertFalse(ok)
+        self.assertEqual(self.campaign.linkedin_post_id, '')
+
+    def test_create_campaign_skips_posting_when_not_connected(self):
+        """post_to_linkedin=True but has_linkedin is False (no creds) must be
+        a silent no-op, not an AttributeError on self.linkedin_creds."""
+        from unittest.mock import patch
+        from hiring_app.services import HiringAutomator
+
+        with patch('hiring_app.services.requests.post') as mock_post:
+            automator = HiringAutomator(linkedin_creds=None)
+            automator.create_campaign(self.campaign, 'JD text', post_to_linkedin=True, apply_url='https://x/')
+            mock_post.assert_not_called()
+        self.assertEqual(self.campaign.linkedin_post_id, '')
+        self.assertEqual(self.campaign.status, 'active')  # still launched
+
+    def test_create_campaign_does_not_post_when_checkbox_unset(self):
+        from unittest.mock import patch
+        from hiring_app.services import HiringAutomator
+
+        with patch('hiring_app.services.requests.post') as mock_post:
+            automator = HiringAutomator(linkedin_creds=self.creds)
+            automator.create_campaign(self.campaign, 'JD text', post_to_linkedin=False, apply_url='https://x/')
+            mock_post.assert_not_called()
+
+    def test_create_campaign_posts_when_opted_in_and_connected(self):
+        from unittest.mock import patch, MagicMock
+        from hiring_app.services import HiringAutomator
+
+        mock_resp = MagicMock(status_code=201, headers={'x-restli-id': 'urn:li:share:111'})
+        mock_resp.raise_for_status.return_value = None
+        with patch('hiring_app.services.requests.post', return_value=mock_resp):
+            automator = HiringAutomator(linkedin_creds=self.creds)
+            automator.create_campaign(self.campaign, 'JD text', post_to_linkedin=True, apply_url='https://x/')
+        self.assertEqual(self.campaign.linkedin_post_id, 'urn:li:share:111')
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.campaign.linkedin_post_id, 'urn:li:share:111')  # create_campaign's save() persisted it
+
+
+class LinkedInPostUrlTests(TestCase):
+    def test_blank_when_never_posted(self):
+        user = User.objects.create_user(username='uma', password='Str0ng!Passphrase42')
+        campaign = Campaign.objects.create(owner=user, role='X')
+        self.assertEqual(campaign.linkedin_post_url, '')
+
+    def test_builds_encoded_feed_url_once_posted(self):
+        user = User.objects.create_user(username='vic', password='Str0ng!Passphrase42')
+        campaign = Campaign.objects.create(owner=user, role='X', linkedin_post_id='urn:li:share:555')
+        self.assertEqual(
+            campaign.linkedin_post_url,
+            'https://www.linkedin.com/feed/update/urn%3Ali%3Ashare%3A555/',
+        )
+
+
+class LinkedInOAuthViewTests(TestCase):
+    """The connect/callback/disconnect views — separate provider and flow
+    from Google's, but the same shape: optional, per-user, no shared token."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='walt', password='Str0ng!Passphrase42')
+
+    def test_connect_requires_login(self):
+        resp = self.client.get('/linkedin/connect/')
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn('/login/', resp['Location'])
+
+    def test_connect_without_client_id_shows_configuration_error(self):
+        from django.test import override_settings
+        self.client.force_login(self.user)
+        with override_settings(LINKEDIN_CLIENT_ID=''):
+            resp = self.client.get('/linkedin/connect/')
+        self.assertEqual(resp.status_code, 200)  # renders the error template, doesn't redirect
+        self.assertContains(resp, 'not configured')
+
+    def test_connect_redirects_to_linkedin_with_state_in_session(self):
+        from django.test import override_settings
+        self.client.force_login(self.user)
+        with override_settings(LINKEDIN_CLIENT_ID='client-123'):
+            resp = self.client.get('/linkedin/connect/')
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn('linkedin.com/oauth/v2/authorization', resp['Location'])
+        self.assertIn('client_id=client-123', resp['Location'])
+        self.assertTrue(self.client.session.get('linkedin_oauth_state'))
+
+    def test_callback_rejects_mismatched_state(self):
+        self.client.force_login(self.user)
+        session = self.client.session
+        session['linkedin_oauth_state'] = 'expected-state'
+        session.save()
+        resp = self.client.get('/linkedin/oauth2callback/', {'code': 'abc', 'state': 'wrong-state'})
+        self.assertContains(resp, 'invalid state')
+        from hiring_app.models import LinkedInOAuthToken
+        self.assertFalse(LinkedInOAuthToken.objects.filter(user=self.user).exists())
+
+    def test_callback_shows_message_on_denied_consent(self):
+        self.client.force_login(self.user)
+        resp = self.client.get('/linkedin/oauth2callback/', {'error': 'user_cancelled_login'})
+        self.assertContains(resp, 'cancelled')
+
+    def test_callback_success_stores_token_and_member_urn(self):
+        from unittest.mock import patch, MagicMock
+        from hiring_app.models import LinkedInOAuthToken
+
+        self.client.force_login(self.user)
+        session = self.client.session
+        session['linkedin_oauth_state'] = 'good-state'
+        session.save()
+
+        token_resp = MagicMock(status_code=200)
+        token_resp.raise_for_status.return_value = None
+        token_resp.json.return_value = {'access_token': 'tok-xyz', 'expires_in': 5183999}
+
+        userinfo_resp = MagicMock(status_code=200)
+        userinfo_resp.raise_for_status.return_value = None
+        userinfo_resp.json.return_value = {'sub': 'member42'}
+
+        with patch('hiring_app.views.requests.post', return_value=token_resp), \
+             patch('hiring_app.views.requests.get', return_value=userinfo_resp):
+            resp = self.client.get('/linkedin/oauth2callback/', {'code': 'auth-code', 'state': 'good-state'})
+
+        self.assertEqual(resp.status_code, 302)
+        token = LinkedInOAuthToken.objects.get(user=self.user)
+        data = json.loads(token.token_json)
+        self.assertEqual(data['access_token'], 'tok-xyz')
+        self.assertEqual(data['member_urn'], 'urn:li:person:member42')
+
+    def test_disconnect_requires_post(self):
+        self.client.force_login(self.user)
+        resp = self.client.get('/linkedin/disconnect/')
+        self.assertEqual(resp.status_code, 405)
+
+    def test_disconnect_removes_token(self):
+        from hiring_app.models import LinkedInOAuthToken
+        LinkedInOAuthToken.objects.create(user=self.user, token_json=json.dumps({
+            'access_token': 'x', 'member_urn': 'y', 'expires_at': 9999999999,
+        }))
+        self.client.force_login(self.user)
+        resp = self.client.post('/linkedin/disconnect/')
+        self.assertEqual(resp.status_code, 302)
+        self.assertFalse(LinkedInOAuthToken.objects.filter(user=self.user).exists())
+
+
+class LinkedInManualConnectTests(TestCase):
+    """The manual paste-a-token alternative to the OAuth flow — for a single
+    self-hosted operator with their own LinkedIn Developer app access, using
+    a token generated by hand from LinkedIn's own portal rather than going
+    through linkedin_connect's consent-screen redirect."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='yusuf', password='Str0ng!Passphrase42')
+
+    def test_requires_login(self):
+        resp = self.client.post('/linkedin/connect-manual/', {'access_token': 'x', 'member_id': 'y'})
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn('/login/', resp['Location'])
+
+    def test_requires_post(self):
+        self.client.force_login(self.user)
+        resp = self.client.get('/linkedin/connect-manual/')
+        self.assertEqual(resp.status_code, 405)
+
+    def test_missing_fields_rejected(self):
+        from hiring_app.models import LinkedInOAuthToken
+        self.client.force_login(self.user)
+        resp = self.client.post('/linkedin/connect-manual/', {'access_token': '', 'member_id': 'abc123'}, follow=True)
+        self.assertContains(resp, 'required')
+        self.assertFalse(LinkedInOAuthToken.objects.filter(user=self.user).exists())
+
+    def test_bare_member_id_gets_normalised_to_a_urn(self):
+        from hiring_app.models import LinkedInOAuthToken
+        self.client.force_login(self.user)
+        self.client.post('/linkedin/connect-manual/', {'access_token': 'tok-1', 'member_id': 'abc123'})
+        token = LinkedInOAuthToken.objects.get(user=self.user)
+        data = json.loads(token.token_json)
+        self.assertEqual(data['member_urn'], 'urn:li:person:abc123')
+        self.assertEqual(data['access_token'], 'tok-1')
+
+    def test_full_urn_is_not_double_prefixed(self):
+        from hiring_app.models import LinkedInOAuthToken
+        self.client.force_login(self.user)
+        self.client.post('/linkedin/connect-manual/', {
+            'access_token': 'tok-1', 'member_id': 'urn:li:person:already-a-urn',
+        })
+        token = LinkedInOAuthToken.objects.get(user=self.user)
+        data = json.loads(token.token_json)
+        self.assertEqual(data['member_urn'], 'urn:li:person:already-a-urn')
+
+    def test_resaving_updates_rather_than_duplicates(self):
+        from hiring_app.models import LinkedInOAuthToken
+        self.client.force_login(self.user)
+        self.client.post('/linkedin/connect-manual/', {'access_token': 'old-tok', 'member_id': 'abc'})
+        self.client.post('/linkedin/connect-manual/', {'access_token': 'new-tok', 'member_id': 'abc'})
+        self.assertEqual(LinkedInOAuthToken.objects.filter(user=self.user).count(), 1)
+        data = json.loads(LinkedInOAuthToken.objects.get(user=self.user).token_json)
+        self.assertEqual(data['access_token'], 'new-tok')
+
+    def test_manually_saved_token_is_immediately_usable(self):
+        """Round-trips through get_user_linkedin_creds — the same function
+        the OAuth-connected path relies on — proving there's exactly one
+        code path downstream regardless of how the token got there."""
+        from hiring_app.services import get_user_linkedin_creds
+        self.client.force_login(self.user)
+        self.client.post('/linkedin/connect-manual/', {'access_token': 'tok-1', 'member_id': 'abc123'})
+        creds = get_user_linkedin_creds(self.user)
+        self.assertIsNotNone(creds)
+        self.assertEqual(creds['access_token'], 'tok-1')
+        self.assertEqual(creds['member_urn'], 'urn:li:person:abc123')
+
+
+class CreateCampaignLinkedInIntegrationTests(TestCase):
+    """The full view-level path: the checkbox on agent.html's launch form
+    actually reaches HiringAutomator.create_campaign and behaves as promised
+    in the flash message."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='xena', password='Str0ng!Passphrase42')
+        self.campaign = Campaign.objects.create(owner=self.user, role='Draft role', status='draft')
+
+    def _launch(self, **extra):
+        data = {'role': 'Engineer', 'jd_text': 'Job description text.'}
+        data.update(extra)
+        return self.client.post(f'/campaign/{self.campaign.pk}/create/', data, follow=True)
+
+    def test_launch_without_linkedin_connection_ignores_checkbox(self):
+        self.client.force_login(self.user)
+        resp = self._launch(post_to_linkedin='on')
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.campaign.status, 'active')
+        self.assertEqual(self.campaign.linkedin_post_id, '')
+        self.assertNotContains(resp, 'LinkedIn')
+
+    def test_launch_with_connection_and_checkbox_posts_and_confirms(self):
+        from unittest.mock import patch, MagicMock
+        from hiring_app.models import LinkedInOAuthToken
+        from django.utils import timezone
+
+        LinkedInOAuthToken.objects.create(user=self.user, token_json=json.dumps({
+            'access_token': 'tok', 'member_urn': 'urn:li:person:1',
+            'expires_at': timezone.now().timestamp() + 3600,
+        }))
+        self.client.force_login(self.user)
+
+        mock_resp = MagicMock(status_code=201, headers={'x-restli-id': 'urn:li:share:42'})
+        mock_resp.raise_for_status.return_value = None
+        with patch('hiring_app.services.requests.post', return_value=mock_resp):
+            resp = self._launch(post_to_linkedin='on')
+
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.campaign.linkedin_post_id, 'urn:li:share:42')
+        self.assertContains(resp, 'Also posted to your LinkedIn feed')
+
+    def test_launch_with_connection_but_unchecked_box_does_not_post(self):
+        from unittest.mock import patch
+        from hiring_app.models import LinkedInOAuthToken
+        from django.utils import timezone
+
+        LinkedInOAuthToken.objects.create(user=self.user, token_json=json.dumps({
+            'access_token': 'tok', 'member_urn': 'urn:li:person:1',
+            'expires_at': timezone.now().timestamp() + 3600,
+        }))
+        self.client.force_login(self.user)
+
+        with patch('hiring_app.services.requests.post') as mock_post:
+            self._launch()  # no post_to_linkedin in the POST data at all
+            mock_post.assert_not_called()
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.campaign.linkedin_post_id, '')
+
+    def test_launch_warns_when_linkedin_post_fails(self):
+        from unittest.mock import patch
+        from hiring_app.models import LinkedInOAuthToken
+        from django.utils import timezone
+        import requests as requests_module
+
+        LinkedInOAuthToken.objects.create(user=self.user, token_json=json.dumps({
+            'access_token': 'tok', 'member_urn': 'urn:li:person:1',
+            'expires_at': timezone.now().timestamp() + 3600,
+        }))
+        self.client.force_login(self.user)
+
+        with patch('hiring_app.services.requests.post', side_effect=requests_module.RequestException('down')):
+            resp = self._launch(post_to_linkedin='on')
+
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.campaign.status, 'active')  # launch still succeeds
+        self.assertEqual(self.campaign.linkedin_post_id, '')
+        self.assertContains(resp, 'posting to LinkedIn failed')
+
+
+class LinkedInAdminRegistrationTests(TestCase):
+    def test_linkedin_oauth_token_is_not_registered(self):
+        from django.contrib import admin
+        from hiring_app.models import LinkedInOAuthToken
+        self.assertNotIn(LinkedInOAuthToken, admin.site._registry)
+
+
+class JdManualFallbackTests(TestCase):
+    """A Gemini failure (quota, outage, bad key) must not strand the
+    recruiter without a way to launch — the editor and Launch button have to
+    appear either way, since the error message itself promises exactly that."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='amber', password='Str0ng!Passphrase42')
+        self.campaign = Campaign.objects.create(owner=self.user, role='New Campaign', status='draft')
+        self.client.force_login(self.user)
+
+    def test_failed_generation_still_shows_editable_jd_textarea(self):
+        from unittest.mock import patch
+        from hiring_app.services import JDGenerationFailed
+        with patch('hiring_app.services.HiringAutomator.generate_jd', side_effect=JDGenerationFailed('quota')):
+            resp = self.client.post(f'/campaign/{self.campaign.pk}/generate-jd/', {
+                'role': 'Backend Engineer', 'experience': '2 years',
+            })
+        self.assertContains(resp, 'name="jd_text"')
+        self.assertContains(resp, 'write your own below')
+        self.assertContains(resp, 'Launch Campaign')
+
+    def test_successful_generation_prefills_jd_textarea_without_the_hint(self):
+        from unittest.mock import patch
+        with patch('hiring_app.services.HiringAutomator.generate_jd', return_value='A drafted JD.'):
+            resp = self.client.post(f'/campaign/{self.campaign.pk}/generate-jd/', {
+                'role': 'Backend Engineer', 'experience': '2 years',
+            })
+        self.assertContains(resp, 'A drafted JD.')
+        self.assertNotContains(resp, 'write your own below')
+
+    def test_can_launch_with_a_manually_written_jd_after_a_failed_generation(self):
+        """The actual end-to-end ask: Gemini down -> write it yourself -> the
+        rest of the launch flow behaves exactly as it would with an AI draft."""
+        from unittest.mock import patch
+        from hiring_app.services import JDGenerationFailed
+        with patch('hiring_app.services.HiringAutomator.generate_jd', side_effect=JDGenerationFailed('quota')):
+            self.client.post(f'/campaign/{self.campaign.pk}/generate-jd/', {
+                'role': 'Backend Engineer', 'experience': '2 years',
+            })
+        resp = self.client.post(f'/campaign/{self.campaign.pk}/create/', {
+            'role': 'Backend Engineer', 'jd_text': 'Hand-written JD text.',
+        }, follow=True)
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.campaign.status, 'active')
+        self.assertEqual(self.campaign.jd_text, 'Hand-written JD text.')
+        self.assertContains(resp, 'is live')
+
+    def test_draft_campaign_reload_preserves_previously_saved_jd_text(self):
+        """Refreshing the page (no fresh generate_jd POST) shouldn't lose a
+        JD that's already been saved — e.g. from an earlier attempt."""
+        self.campaign.jd_text = 'Previously saved JD.'
+        self.campaign.role = 'Backend Engineer'
+        self.campaign.save()
+        resp = self.client.get(f'/campaign/{self.campaign.pk}/')
+        self.assertContains(resp, 'Previously saved JD.')
+
+    def test_active_campaign_does_not_show_relaunch_form_on_plain_reload(self):
+        """Once launched, a plain page visit must not re-offer the launch
+        form — create_campaign isn't idempotent about Sheet creation, so
+        resubmitting it for an already-active campaign would create a
+        duplicate tracking Sheet (see SheetCreationIdempotencyTests)."""
+        self.campaign.jd_text = 'Live JD.'
+        self.campaign.status = 'active'
+        self.campaign.save()
+        resp = self.client.get(f'/campaign/{self.campaign.pk}/')
+        self.assertNotContains(resp, 'Launch Campaign')
+
+
+class SheetCreationIdempotencyTests(TestCase):
+    """create_campaign used to create a brand-new tracking Sheet on every
+    call with no check for an existing one — re-launching (or, after the fix
+    above, simply reloading a still-draft campaign's page and resubmitting)
+    would silently orphan the previous Sheet."""
+
+    def _connected_automator(self):
+        from unittest.mock import MagicMock
+        from hiring_app.services import HiringAutomator
+        automator = HiringAutomator()
+        automator.creds = object()   # has_google only checks creds/gmail are not None
+        automator.gmail = MagicMock()
+        automator.sheets = MagicMock()
+        return automator
+
+    def test_skips_sheet_creation_when_one_already_exists(self):
+        user = User.objects.create_user(username='yara', password='Str0ng!Passphrase42')
+        campaign = Campaign.objects.create(
+            owner=user, role='Analyst', status='active',
+            sheet_id='existing-sheet-id', sheet_url='https://existing/',
+        )
+        automator = self._connected_automator()
+        automator.create_campaign(campaign, 'JD text')
+        automator.sheets.spreadsheets.return_value.create.assert_not_called()
+        self.assertEqual(campaign.sheet_id, 'existing-sheet-id')
+
+    def test_creates_sheet_when_none_exists_yet(self):
+        user = User.objects.create_user(username='zane', password='Str0ng!Passphrase42')
+        campaign = Campaign.objects.create(owner=user, role='Analyst', status='draft')
+        automator = self._connected_automator()
+        automator.sheets.spreadsheets.return_value.create.return_value.execute.return_value = {
+            'spreadsheetId': 'new-id', 'spreadsheetUrl': 'https://new/',
+        }
+        automator.create_campaign(campaign, 'JD text')
+        automator.sheets.spreadsheets.return_value.create.assert_called_once()
+        self.assertEqual(campaign.sheet_id, 'new-id')
+
+
+class GoogleOptionalUiTests(TestCase):
+    """Google/LinkedIn are meant to read as optional extras, not required
+    setup — these check the actual UI surfaces the user pointed at: the
+    navbar, the landing page's stale claims, the dashboard's Integrations
+    panel, and the one real functional risk of skipping Google (no email
+    provider configured in production)."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='bo', password='Str0ng!Passphrase42')
+
+    def test_landing_page_no_longer_claims_google_forms_or_drive(self):
+        """The old copy advertised features removed back in Phase 1-2
+        (Forms, Drive) as if they still existed. The new copy is allowed to
+        *mention* "Google Form" to reassure readers one isn't needed — what
+        it must never do again is claim these as active tech/features."""
+        resp = self.client.get('/')
+        content = resp.content.decode()
+        self.assertNotIn('Auto Google Forms', content)
+        self.assertNotIn('Google Forms API', content)
+        self.assertNotIn('Google Drive', content)
+        self.assertNotIn('Drive API', content)
+        self.assertNotIn('downloads resumes from Drive', content)
+
+    def test_navbar_has_no_persistent_connect_google_button(self):
+        """The button used to sit next to the user's identity on every page
+        (a dedicated CSS class, google-connect-btn) — it's now a neutral
+        'Integrations' link to the dashboard instead. 'Connect Google' text
+        legitimately still appears elsewhere, inside the dashboard's
+        Integrations panel — this checks the navbar specifically, not the
+        whole page."""
+        self.client.force_login(self.user)
+        resp = self.client.get('/dashboard/')
+        self.assertNotContains(resp, 'google-connect-btn')
+        self.assertContains(resp, 'href="/dashboard/#integrations"')
+
+    def test_dashboard_shows_integrations_panel_with_connect_links_when_disconnected(self):
+        self.client.force_login(self.user)
+        resp = self.client.get('/dashboard/')
+        self.assertContains(resp, 'id="integrations"')
+        self.assertContains(resp, 'Connect Google')  # inside the panel now, not the navbar
+        self.assertContains(resp, 'Connect LinkedIn')
+
+    def test_dashboard_shows_connected_badges_and_disconnect_when_connected(self):
+        from hiring_app.models import GoogleOAuthToken, LinkedInOAuthToken
+        GoogleOAuthToken.objects.create(user=self.user, token_json=json.dumps({'refresh_token': 'x'}))
+        LinkedInOAuthToken.objects.create(user=self.user, token_json=json.dumps({
+            'access_token': 'x', 'member_urn': 'y', 'expires_at': 9999999999,
+        }))
+        self.client.force_login(self.user)
+        resp = self.client.get('/dashboard/')
+        self.assertContains(resp, 'Connected', count=2)
+
+    def test_email_not_configured_warning_hidden_in_debug(self):
+        self.client.force_login(self.user)
+        resp = self.client.get('/dashboard/')  # test settings run with DEBUG=True
+        self.assertNotContains(resp, 'No email provider is configured')
+
+    def test_email_not_configured_warning_shown_in_production_without_smtp_host(self):
+        self.client.force_login(self.user)
+        with override_settings(DEBUG=False, EMAIL_HOST=''):
+            resp = self.client.get('/dashboard/')
+        self.assertContains(resp, 'No email provider is configured')
+
+    def test_email_not_configured_warning_hidden_once_smtp_host_is_set(self):
+        self.client.force_login(self.user)
+        with override_settings(DEBUG=False, EMAIL_HOST='smtp.resend.com'):
+            resp = self.client.get('/dashboard/')
+        self.assertNotContains(resp, 'No email provider is configured')

@@ -133,6 +133,9 @@
             {% if campaign.sheet_url %}
             <a href="{{ campaign.sheet_url }}" target="_blank" class="btn btn-sm btn-outline">📊 Sheet</a>
             {% endif %}
+            {% if campaign.linkedin_post_url %}
+            <a href="{{ campaign.linkedin_post_url }}" target="_blank" class="btn btn-sm btn-outline">💼 LinkedIn Post</a>
+            {% endif %}
           {% endif %}
           <form method="post" action="{% url 'new_campaign' %}" class="inline-form">
             {% csrf_token %}
@@ -196,7 +199,7 @@
               <label class="form-label">Experience</label>
               <input type="text" name="experience" class="form-control"
                      placeholder="e.g. 2 years"
-                     value="{{ exp_preview|default:'' }}" required>
+                     value="{{ exp_preview|default:campaign.experience }}" required>
             </div>
             <button type="submit" class="btn btn-primary" id="generate-btn">
               ✨ Generate JD
@@ -204,17 +207,56 @@
           </div>
         </form>
 
-        <!-- JD Preview & Campaign Launch -->
-        {% if jd_preview %}
+        <!-- JD Preview & Campaign Launch. Gated on show_jd_editor (set by -->
+        <!-- generate_jd on every attempt, success or failure) — NOT on -->
+        <!-- jd_preview alone, which is '' when Gemini fails and would -->
+        <!-- otherwise hide this editor entirely right when it's needed -->
+        <!-- most: writing the JD by hand instead. Also shown on a plain -->
+        <!-- reload of a still-draft campaign that already has a saved -->
+        <!-- jd_text, so refreshing the page doesn't lose it — but only -->
+        <!-- while still draft: re-showing (and re-submitting) this form -->
+        <!-- for an already-active campaign would re-run create_campaign, -->
+        <!-- which creates a brand new tracking Sheet every call with no -->
+        <!-- check for an existing one, orphaning the old one. -->
+        {% if show_jd_editor or campaign.jd_text and campaign.status == 'draft' %}
         <div class="divider"></div>
         <form action="{% url 'create_campaign' campaign_id %}" method="post">
           {% csrf_token %}
-          <input type="hidden" name="role" value="{{ role_preview }}">
+          <input type="hidden" name="role" value="{{ role_preview|default:campaign.role }}">
 
           <div class="form-group">
             <label class="form-label">📄 Review & Edit Job Description</label>
+            {% if show_jd_editor and not jd_preview %}
+            <div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:0.5rem;">
+              Gemini couldn't draft one just now — write your own below and launch as usual.
+            </div>
+            {% endif %}
             <textarea name="jd_text" class="form-control" rows="10"
-                      style="font-family:inherit; font-size:0.875rem; line-height:1.65;">{{ jd_preview }}</textarea>
+                      placeholder="Paste or write the job description here…"
+                      style="font-family:inherit; font-size:0.875rem; line-height:1.65;">{{ jd_preview|default:campaign.jd_text }}</textarea>
+          </div>
+
+          <!-- Optional LinkedIn cross-post — only offered once a LinkedIn -->
+          <!-- connection actually exists; otherwise just a link to start one. -->
+          <div class="form-group">
+            {% if has_linkedin %}
+            <label class="apply-consent-label" style="font-size:0.85rem;">
+              <input type="checkbox" name="post_to_linkedin" class="fancy-check">
+              <span>💼 Also post this JD to your LinkedIn feed</span>
+            </label>
+            <div style="font-size:0.75rem; color:var(--text-muted); margin-top:0.35rem;">
+              Posts once, on launch, from your connected LinkedIn account.
+              <form method="post" action="{% url 'linkedin_disconnect' %}" class="inline-form" style="display:inline;">
+                {% csrf_token %}
+                <button type="submit" style="background:none; border:none; padding:0; color:var(--accent-cyan); cursor:pointer; font-size:inherit;">Disconnect LinkedIn</button>
+              </form>
+            </div>
+            {% else %}
+            <div style="font-size:0.8rem; color:var(--text-muted);">
+              💼 <a href="{% url 'linkedin_connect' %}" style="color:var(--accent-cyan);">Connect LinkedIn</a>
+              to optionally post this JD to your feed when you launch.
+            </div>
+            {% endif %}
           </div>
 
           <button type="submit" class="btn btn-success btn-full">

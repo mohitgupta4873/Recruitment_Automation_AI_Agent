@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Django app that automates an end-to-end hiring workflow: generate a JD with Gemini → launch a campaign with its own public apply page (optionally with a Google Sheet for tracking) → candidates apply directly with a resume upload, which is scored against AI-derived keywords for the role → send Google Calendar interview invites → send offer/rejection emails and log outcomes. Google (Sheets export, Gmail send) is optional throughout — every step also works through Django's own email backend when it isn't connected. Invites and outcomes run as background Celery tasks, not inline in the request. Candidate resumes are auto-purged N days after a campaign closes, and a recruiter can permanently delete their own account (and everything owned by it) from their dashboard.
+A Django app that automates an end-to-end hiring workflow: generate a JD with Gemini → launch a campaign with its own public apply page (optionally with a Google Sheet for tracking, and optionally cross-posted to the recruiter's own LinkedIn feed) → candidates apply directly with a resume upload, which is scored against AI-derived keywords for the role → send Google Calendar interview invites → send offer/rejection emails and log outcomes. Google (Sheets export, Gmail send) and LinkedIn (cross-post) are both optional throughout — every step also works through Django's own email backend when Google isn't connected, and campaigns launch fine with no LinkedIn connection at all. Invites and outcomes run as background Celery tasks, not inline in the request. Candidate resumes are auto-purged N days after a campaign closes, and a recruiter can permanently delete their own account (and everything owned by it) from their dashboard.
 
 There is effectively one Django app, `hiring_app`, inside the project `my_hiring_project`. Almost all business logic lives in `hiring_app/services.py` (Google/Gemini calls) and `hiring_app/models.py` (persistence). `hiring_app/views.py` is a thin controller layer over both.
 
@@ -38,13 +38,15 @@ python manage.py migrate
 # Run tests — hiring_app/tests.py covers Phase 0 security hardening (method
 # guards, password policy, recipient validation), Phase 1 (ownership,
 # encryption), Phase 2 (apply-page validation, scoring), Phase 3
-# (background-task idempotency), and Phase 4 (resume-file cleanup on delete,
-# retention purge, account deletion, legal pages). File storage under test is
-# redirected to a temp dir wherever a test writes a real Candidate.resume
-# file (ApplyPageTests, ResumeRetentionTests, AccountDeletionTests) — don't
-# remove those overrides, or running the suite writes real files under
-# media/resumes/. Celery tasks run eagerly under the test runner
-# (settings.py: `if TESTING`) — no broker needed.
+# (background-task idempotency), Phase 4 (resume-file cleanup on delete,
+# retention purge, account deletion, legal pages), and the LinkedIn
+# cross-post feature (OAuth flow, opt-in posting, best-effort failure
+# handling). File storage under test is redirected to a temp dir wherever a
+# test writes a real Candidate.resume file (ApplyPageTests,
+# ResumeRetentionTests, AccountDeletionTests) — don't remove those
+# overrides, or running the suite writes real files under media/resumes/.
+# Celery tasks run eagerly under the test runner (settings.py: `if
+# TESTING`) — no broker needed.
 python manage.py test
 
 # Django's own checks. The --deploy variant is the pre-launch gate and must
@@ -62,6 +64,28 @@ shared cache with atomic increment or login/register are effectively unthrottled
 `FIELD_ENCRYPTION_KEY` is the same pattern, guarding `GoogleOAuthToken.token_json`
 (see Architecture below) — required outside `DEBUG`, derived deterministically from
 `SECRET_KEY` in dev so it survives restarts without another env var to remember.
+
+**Not enforced by a boot-time check, but just as required in practice: `EMAIL_HOST`
+et al.** Google (Sheets/Gmail) is an optional, per-user, individually-connected
+extra — invites and outcome emails are delivered through Django's own configured
+`EMAIL_BACKEND` regardless of whether any recruiter ever connects Google (see
+"LinkedIn cross-post"/"Google OAuth" below and `.env.example`'s Email section).
+With `DEBUG=False` and no real SMTP provider configured, that backend has nothing
+to actually deliver through — invites/outcomes "send" without error (Django's SMTP
+backend just fails per-recipient, already swallowed by the per-candidate
+try/except in `services.py`) but never arrive. Use a transactional provider
+(Resend/SendGrid/SES), not Gmail SMTP, for real production volume — Gmail SMTP's
+~500/day cap and cloud-IP deliverability issues make it a stopgap, not the
+long-term answer, though it's a perfectly fine one when you don't yet own a
+domain to verify with a transactional provider (see below).
+
+`EMAIL_HOST` is read regardless of `DEBUG` (not just outside it, as it used to
+be) specifically so local dev can opt into real sends without flipping
+`DEBUG=False` — which would also demand `REDIS_URL`/`FIELD_ENCRYPTION_KEY` and
+break plain-HTTP `runserver` access via `SECURE_SSL_REDIRECT`. With `DEBUG=True`
+and `EMAIL_HOST` unset (the common case), the console backend is still the
+default — nobody gets switched to real delivery by accident; setting `EMAIL_HOST`
+locally is a deliberate, explicit opt-in.
 
 One-time step after cloning a repo that still has a `campaigns/` directory from
 before Phase 1: `python manage.py import_legacy_campaigns` migrates it into the
@@ -162,9 +186,12 @@ Key methods, roughly in workflow order:
   markdown fence, tolerates non-JSON) and **never raises** — falls back to
   `FALLBACK_KEYWORDS` (the old hardcoded 9-keyword list) on any failure, so a
   Gemini outage never blocks launching a campaign.
-- `create_campaign(campaign, jd_text)` — stores the JD, calls the above, sets
-  `status='active'`. If `has_google`, best-effort creates a tracking Sheet;
-  if not, the campaign is still fully live through the apply page alone.
+- `create_campaign(campaign, jd_text, post_to_linkedin=False, apply_url=None)` —
+  stores the JD, calls the above, sets `status='active'`. If `has_google`,
+  best-effort creates a tracking Sheet; if not, the campaign is still fully
+  live through the apply page alone. `post_to_linkedin` is a separate,
+  explicit per-launch opt-in — see "LinkedIn cross-post" below — silently
+  ignored if `has_linkedin` is False rather than erroring.
 - `process_application(campaign, cleaned_data)` — the apply-page equivalent of
   the old `sync_responses`: extracts text from the uploaded PDF in memory,
   scores it against `campaign.scoring_keywords` (or `FALLBACK_KEYWORDS`), and
@@ -205,6 +232,75 @@ Resumes are served back to the recruiter (never to anyone else) through
 `views.view_resume`, ownership-checked the same way every campaign view is —
 without it, resumes uploaded through the apply page would be write-only:
 saved, scored, and permanently unreachable through the UI.
+
+### LinkedIn cross-post (optional, per-launch opt-in)
+
+A recruiter can optionally connect LinkedIn and, at the moment they launch a
+campaign, check a box to also post that campaign's JD to their own LinkedIn
+feed. This existed once as a "paste a raw UGC access token into a form field"
+feature, was removed for exactly that reason (no real user has such a token
+to paste, and persisting one that way is a worse security posture than not
+having the feature at all), and has been reinstated here as proper per-user
+OAuth — the same shape as Google's connection, not the old shortcut.
+
+- **`LinkedInOAuthToken`** (`models.py`) — one row per user, `token_json`
+  encrypted the same way as `GoogleOAuthToken` (holds `access_token`,
+  `expires_at`, `member_urn`). No refresh token: the scopes this app
+  requests (`openid profile w_member_social`) don't grant one, so
+  `services.get_user_linkedin_creds` treats an expired token as "not
+  connected" rather than erroring — the fix is reconnecting via
+  `linkedin_connect`, not a silent refresh.
+- **`views.linkedin_connect`/`linkedin_oauth_callback`/`linkedin_disconnect`**
+  — a separate OAuth flow from Google's, built on plain `requests` calls
+  (no SDK dependency added for one provider). Uses a `state` value
+  round-tripped through the session for CSRF protection; no PKCE, since
+  LinkedIn's flow doesn't require it the way Google's does. `linkedin_connect`
+  fails soft (renders `linkedin_connect.html` with an error) if
+  `LINKEDIN_CLIENT_ID`/`LINKEDIN_CLIENT_SECRET` aren't set — the feature is
+  entirely absent, not broken, when unconfigured. Unlike Google, there is no
+  public revoke endpoint to call on disconnect; `linkedin_disconnect` says so
+  in its own success message rather than implying a full revoke happened.
+- **`HiringAutomator.post_jd_to_linkedin(campaign, jd_text, apply_url)`** —
+  posts via the UGC Posts API, best-effort exactly like the Sheets export:
+  never raises, and a failure never blocks or un-launches a campaign. Sets
+  `Campaign.linkedin_post_id` on success (not saved directly — `create_campaign`'s
+  own `save()` covers it, matching how `sheet_id`/`sheet_url` are handled).
+  `Campaign.linkedin_post_url` (a model property) builds a shareable feed
+  link from that ID for the UI.
+- **The checkbox itself is opt-in per launch, not implied by having a
+  connection** — connecting once shouldn't mean every future campaign gets
+  posted without asking again. `agent.html`'s launch form only renders the
+  checkbox when `has_linkedin` is true (a currently-valid connection); when
+  it's not, a "Connect LinkedIn" link is shown instead. `views.create_campaign`
+  gates its post-launch messaging on `automator.has_linkedin`, not just
+  whether the checkbox was submitted — otherwise a stale form resubmission
+  with the box checked but no real connection would misreport "posting to
+  LinkedIn failed" for an attempt that was never actually made.
+- **Not re-verified**: whether `w_member_social` (the "Share on LinkedIn"
+  product) is still self-serve-approved for a new LinkedIn Developer app, or
+  requires additional review, was not re-checked against LinkedIn's current
+  developer portal policy when this was written — verify that before relying
+  on this in production. `LINKEDIN_CLIENT_ID`/`LINKEDIN_CLIENT_SECRET` blank
+  disables the feature entirely rather than erroring either way.
+- **`views.linkedin_connect_manual`** (added after the above) — a second,
+  manual path into the exact same `LinkedInOAuthToken` row: paste an access
+  token + member ID/URN generated by hand from the LinkedIn Developer
+  Portal's own Token Generator tool (app → Auth → OAuth 2.0 tools), instead
+  of going through `linkedin_connect`'s redirect-based consent screen. This
+  sidesteps LinkedIn's own OAuth review/approval gating on the client
+  entirely, since generating a token for yourself via the portal is a
+  developer action, not a public consent flow — plausibly why this "just
+  worked" for a single self-hosted operator via the old paste-a-token UI
+  before it was pulled in Phase 2. Reinstated deliberately as a *second*
+  path alongside the OAuth flow, not a replacement — the OAuth flow is what
+  this app would need for real multi-tenant public signups (Phase 5); this
+  manual one is scoped to "I already have developer access to my own
+  LinkedIn app." Normalizes a bare member ID into `urn:li:person:<id>` if
+  it isn't already a full `urn:li:...` string; assumes the same ~60-day
+  expiry the OAuth path defaults to, since the Token Generator doesn't hand
+  back a parseable one. Feeds `get_user_linkedin_creds`/`post_jd_to_linkedin`
+  identically either way — one downstream code path regardless of how the
+  token got there.
 
 ### Google OAuth (strictly per-user, and optional)
 

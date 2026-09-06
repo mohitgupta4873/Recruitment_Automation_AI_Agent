@@ -1,5 +1,7 @@
 import json
 import logging
+import secrets
+from urllib.parse import urlencode
 
 import requests
 
@@ -15,13 +17,18 @@ from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.http import JsonResponse
+from django.utils import timezone
 from django.views.decorators.http import require_POST, require_http_methods
 from django_ratelimit.decorators import ratelimit
 
 from google_auth_oauthlib.flow import Flow
 
-from .services import HiringAutomator, SCOPES, JDGenerationFailed, get_user_google_creds
-from .models import GoogleOAuthToken, Campaign, Candidate
+from .services import (
+    HiringAutomator, SCOPES, JDGenerationFailed,
+    get_user_google_creds, get_user_linkedin_creds,
+    LINKEDIN_SCOPES, LINKEDIN_AUTHORIZATION_URL, LINKEDIN_TOKEN_URL, LINKEDIN_USERINFO_URL,
+)
+from .models import GoogleOAuthToken, LinkedInOAuthToken, Campaign, Candidate
 from .forms import ApplicationForm
 from .tasks import send_invites_task, send_outcomes_task
 
@@ -62,8 +69,12 @@ def _build_oauth_flow(request, state=None, code_verifier=None):
 def _automator_for(request):
     # get_user_google_creds moved to services.py in Phase 3 so hiring_app/tasks.py
     # can use it too, without importing views.py (which imports tasks.py to
-    # enqueue — that way lies a circular import).
-    return HiringAutomator(creds=get_user_google_creds(request.user))
+    # enqueue — that way lies a circular import). get_user_linkedin_creds
+    # follows the same pattern for the optional LinkedIn cross-post.
+    return HiringAutomator(
+        creds=get_user_google_creds(request.user),
+        linkedin_creds=get_user_linkedin_creds(request.user),
+    )
 
 
 def _get_owned_campaign(request, campaign_id):
@@ -83,6 +94,11 @@ def _agent_context(request, campaign, extra=None):
         'history':       Campaign.objects.filter(owner=request.user).exclude(pk=campaign.pk),
         'current_role':  campaign.role,
         'has_google':    GoogleOAuthToken.objects.filter(user=request.user).exists(),
+        # Unlike has_google, this checks the connection is actually still
+        # usable (get_user_linkedin_creds returns None on an expired token,
+        # not just a missing one) — LinkedIn tokens don't auto-refresh, so a
+        # stale row shouldn't make the launch-time checkbox appear to work.
+        'has_linkedin':  get_user_linkedin_creds(request.user) is not None,
     }
     if extra:
         ctx.update(extra)
@@ -307,6 +323,176 @@ def _revoke_google_token(token_record):
 
 
 # ─────────────────────────────────────────────────────────────
+# LINKEDIN OAUTH — optional "post this JD to LinkedIn" feature
+#
+# Separate from Google's OAuth entirely: different provider, different
+# scopes, connected/disconnected independently. A user can post to LinkedIn
+# with no Google connection at all, or vice versa.
+# ─────────────────────────────────────────────────────────────
+
+def _linkedin_redirect_uri(request):
+    return request.build_absolute_uri('/linkedin/oauth2callback/')
+
+
+@login_required
+def linkedin_connect(request):
+    """Start the LinkedIn OAuth2 flow — redirects to LinkedIn's consent screen.
+
+    Plain 3-legged OAuth (LinkedIn has no PKCE requirement for this flow,
+    unlike Google) — a `state` value round-tripped through the session is
+    enough CSRF protection, checked in linkedin_oauth_callback below.
+    """
+    if not settings.LINKEDIN_CLIENT_ID:
+        logger.error("LinkedIn OAuth start attempted but LINKEDIN_CLIENT_ID is not set")
+        return render(request, 'hiring_app/linkedin_connect.html', {
+            'error': 'LinkedIn sign-in is not configured yet. Please contact the administrator.',
+        })
+
+    state = secrets.token_urlsafe(24)
+    request.session['linkedin_oauth_state'] = state
+    params = {
+        'response_type': 'code',
+        'client_id': settings.LINKEDIN_CLIENT_ID,
+        'redirect_uri': _linkedin_redirect_uri(request),
+        'state': state,
+        'scope': LINKEDIN_SCOPES,
+    }
+    return redirect(f'{LINKEDIN_AUTHORIZATION_URL}?{urlencode(params)}')
+
+
+@login_required
+def linkedin_oauth_callback(request):
+    """Handle LinkedIn's OAuth2 callback: exchange the code for an access
+    token, resolve the connecting member's URN via the OIDC userinfo
+    endpoint (needed as the `author` on every UGC post), and store both.
+    """
+    error = request.GET.get('error')
+    if error:
+        logger.info(f"LinkedIn OAuth denied for user id={request.user.id}: {error}")
+        return render(request, 'hiring_app/linkedin_connect.html', {
+            'error': 'LinkedIn sign-in was cancelled.',
+        })
+
+    expected_state = request.session.pop('linkedin_oauth_state', None)
+    if not expected_state or expected_state != request.GET.get('state'):
+        logger.warning(f"LinkedIn OAuth state mismatch for user id={request.user.id}")
+        return render(request, 'hiring_app/linkedin_connect.html', {
+            'error': 'LinkedIn sign-in failed (invalid state). Please try again.',
+        })
+
+    try:
+        token_resp = requests.post(LINKEDIN_TOKEN_URL, data={
+            'grant_type': 'authorization_code',
+            'code': request.GET.get('code'),
+            'redirect_uri': _linkedin_redirect_uri(request),
+            'client_id': settings.LINKEDIN_CLIENT_ID,
+            'client_secret': settings.LINKEDIN_CLIENT_SECRET,
+        }, timeout=15)
+        token_resp.raise_for_status()
+        token_data = token_resp.json()
+        access_token = token_data['access_token']
+        # LinkedIn's own default under these scopes is ~60 days; fall back to
+        # that if expires_in is ever absent from the response.
+        expires_in = token_data.get('expires_in', 60 * 24 * 3600)
+
+        userinfo_resp = requests.get(
+            LINKEDIN_USERINFO_URL,
+            headers={'Authorization': f'Bearer {access_token}'},
+            timeout=15,
+        )
+        userinfo_resp.raise_for_status()
+        member_id = userinfo_resp.json()['sub']
+
+        LinkedInOAuthToken.objects.update_or_create(
+            user=request.user,
+            defaults={'token_json': json.dumps({
+                'access_token': access_token,
+                'expires_at': timezone.now().timestamp() + expires_in,
+                'member_urn': f'urn:li:person:{member_id}',
+            })},
+        )
+        logger.info(f"LinkedIn account connected for user: {request.user.username}")
+        return redirect('agent')
+    except Exception:
+        # Do not render {e}: same reasoning as the Google callback — can leak
+        # client IDs, token endpoints, and paths.
+        logger.exception(f"LinkedIn OAuth callback failed for user id={request.user.id}")
+        return render(request, 'hiring_app/linkedin_connect.html', {
+            'error': 'LinkedIn sign-in failed. Please try connecting again.',
+        })
+
+
+@login_required
+@require_POST
+def linkedin_disconnect(request):
+    """Remove the stored LinkedIn token.
+
+    Unlike Google, LinkedIn doesn't offer a public token-revocation endpoint
+    for member-facing apps — deleting this row stops the app from being able
+    to post, but full revocation of the grant itself has to happen from the
+    member's own LinkedIn settings (Settings & Privacy → Data privacy →
+    Permitted services). Said so explicitly in the success message rather
+    than implying a Google-style full revoke happened.
+    """
+    if LinkedInOAuthToken.objects.filter(user=request.user).delete()[0]:
+        logger.info(f"LinkedIn account disconnected for user id={request.user.id}")
+        messages.success(
+            request,
+            "Your LinkedIn account has been disconnected here. To fully revoke access, "
+            "also remove HireAI from linkedin.com under Settings & Privacy → Permitted services.",
+        )
+    return redirect('agent')
+
+
+@login_required
+@require_POST
+def linkedin_connect_manual(request):
+    """Manual alternative to the OAuth flow above: paste an access token and
+    member ID/URN directly, generated by hand from LinkedIn's own Developer
+    Portal (app → Auth tab → OAuth 2.0 tools → Token Generator) instead of
+    going through linkedin_connect's redirect-based consent screen.
+
+    This is deliberately a second path, not a replacement — the OAuth flow
+    above is what this app would use for real multi-tenant public users (see
+    ROADMAP.md's original reasoning for removing the old paste-a-token UI
+    entirely in Phase 2: "no real user has such a token to paste"). But for a
+    single self-hosted operator who already has developer access to their
+    own LinkedIn app, generating a token by hand from the Developer Portal
+    sidesteps LinkedIn's own OAuth consent screen and any "Share on
+    LinkedIn" product-approval gating on the OAuth client entirely — which is
+    plausibly why this "just worked" for one person months ago via the old
+    UI, before it was pulled for being unsafe to expose to arbitrary public
+    signups. Reintroduced here as an opt-in, not the default path.
+
+    LinkedIn's Token Generator doesn't hand back a parseable expiry the way
+    the OAuth token endpoint does — assume the same ~60-day window the OAuth
+    path defaults to; get_user_linkedin_creds treats an expired token as
+    'not connected' either way, so the fix when it lapses is just pasting a
+    fresh one here.
+    """
+    access_token = request.POST.get('access_token', '').strip()
+    member_id = request.POST.get('member_id', '').strip()
+
+    if not access_token or not member_id:
+        messages.error(request, "Both the access token and member ID/URN are required.")
+        return redirect('dashboard')
+
+    member_urn = member_id if member_id.startswith('urn:li:') else f'urn:li:person:{member_id}'
+
+    LinkedInOAuthToken.objects.update_or_create(
+        user=request.user,
+        defaults={'token_json': json.dumps({
+            'access_token': access_token,
+            'member_urn': member_urn,
+            'expires_at': timezone.now().timestamp() + 60 * 24 * 3600,
+        })},
+    )
+    logger.info(f"LinkedIn account connected manually for user id={request.user.id}")
+    messages.success(request, "LinkedIn connected — the token will need re-pasting here in ~60 days.")
+    return redirect('dashboard')
+
+
+# ─────────────────────────────────────────────────────────────
 # PROTECTED — Dashboard Overview
 # ─────────────────────────────────────────────────────────────
 
@@ -324,6 +510,14 @@ def dashboard_overview(request):
         'active_campaigns': active_campaigns,
         'total_candidates': total_candidates,
         'has_google':       GoogleOAuthToken.objects.filter(user=user).exists(),
+        'has_linkedin':     LinkedInOAuthToken.objects.filter(user=user).exists(),
+        # Google is optional; a real email backend is not. In production
+        # with no SMTP host configured, invites/outcomes "send" without
+        # raising (the per-candidate try/except in services.py swallows the
+        # failure) but never actually arrive — this is the one way skipping
+        # Google could silently mean nothing gets delivered. DEBUG mode
+        # always uses the console backend, so this only fires in production.
+        'email_not_configured': not settings.DEBUG and not getattr(settings, 'EMAIL_HOST', ''),
     }
     return render(request, 'hiring_app/dashboard_overview.html', context)
 
@@ -342,6 +536,7 @@ def delete_account_confirm(request):
         'campaign_count':  campaigns.count(),
         'candidate_count': Candidate.objects.filter(campaign__owner=user).count(),
         'has_google':      GoogleOAuthToken.objects.filter(user=user).exists(),
+        'has_linkedin':    LinkedInOAuthToken.objects.filter(user=user).exists(),
     })
 
 
@@ -352,8 +547,11 @@ def delete_account(request):
     connected Google grant, then deletes the User row, which CASCADEs to
     every Campaign the user owns, which CASCADEs to every Candidate in those
     campaigns — and the post_delete signal on Candidate (models.py) removes
-    each one's resume file from disk as it goes. Nothing here targets
-    another user's data; `request.user` is the only row this can ever touch.
+    each one's resume file from disk as it goes. The User CASCADE also takes
+    out any LinkedInOAuthToken row; there's no revoke call for it first (see
+    linkedin_disconnect) since LinkedIn has no public revoke endpoint to hit.
+    Nothing here targets another user's data; `request.user` is the only row
+    this can ever touch.
     """
     if request.POST.get('confirm') != 'DELETE':
         messages.error(request, 'Type DELETE exactly to confirm account deletion.')
@@ -474,9 +672,16 @@ def generate_jd(request, campaign_id):
     campaign.save(update_fields=['role', 'experience', 'updated_at'])
 
     ctx = _agent_context(request, campaign, {
-        'jd_preview':   jd,
-        'role_preview': role,
-        'exp_preview':  experience,
+        'jd_preview':     jd,
+        'role_preview':   role,
+        'exp_preview':    experience,
+        # Set on every attempt, success or failure — agent.html gates the
+        # JD-editor + launch form on this, not on `jd_preview` being
+        # non-empty. It used to be gated on jd_preview alone, which meant
+        # the "you can write one manually" message above was a lie: on a
+        # JDGenerationFailed, jd is '' (falsy), so the editor never rendered
+        # and there was no textarea to write into at all.
+        'show_jd_editor': True,
     })
     return render(request, 'hiring_app/agent.html', ctx)
 
@@ -490,10 +695,14 @@ def create_campaign(request, campaign_id):
     Google is optional — HiringAutomator.create_campaign only touches Sheets,
     best-effort, if the recruiter has connected an account. There's no more
     Forms/Drive step, so there's nothing here that hard-requires Google.
+    LinkedIn is the same shape: optional, and only attempted if the
+    "post_to_linkedin" checkbox was submitted (agent.html only renders it at
+    all when the recruiter has a working LinkedIn connection).
     """
     campaign = _get_owned_campaign(request, campaign_id)
     role = request.POST.get('role', '').strip()
     jd   = request.POST.get('jd_text', '')
+    post_to_linkedin = request.POST.get('post_to_linkedin') == 'on'
 
     if not role:
         messages.error(request, "Enter a role title before launching a campaign.")
@@ -501,11 +710,26 @@ def create_campaign(request, campaign_id):
 
     campaign.role = role
     automator = _automator_for(request)
+    apply_url = request.build_absolute_uri(reverse('apply', args=[campaign.public_token]))
 
     try:
-        automator.create_campaign(campaign, jd)
+        automator.create_campaign(campaign, jd, post_to_linkedin=post_to_linkedin, apply_url=apply_url)
         logger.info(f"Campaign launched: campaign={campaign.pk} by user id={request.user.id}")
-        messages.success(request, f"Campaign for “{role}” is live — share the apply link with candidates.")
+        success_msg = f"Campaign for “{role}” is live — share the apply link with candidates."
+        # Gate on automator.has_linkedin, not just the submitted checkbox —
+        # if there's no actual connection (checkbox submitted via a stale
+        # page load, say), create_campaign silently skipped posting
+        # entirely, and a "posting failed" warning would be a false alarm
+        # about an attempt that never happened.
+        if post_to_linkedin and automator.has_linkedin:
+            # Best-effort like Sheets export, but unlike Sheets the recruiter
+            # explicitly asked for this one this time (checked the box), so
+            # tell them plainly if it didn't happen rather than staying quiet.
+            if campaign.linkedin_post_id:
+                success_msg += " Also posted to your LinkedIn feed."
+            else:
+                messages.warning(request, "Campaign launched, but posting to LinkedIn failed. You can share it manually.")
+        messages.success(request, success_msg)
     except Exception:
         logger.exception(f"Campaign creation failed for user id={request.user.id}")
         messages.error(request, "Could not launch the campaign. Please try again.")

@@ -20,6 +20,19 @@
       </form>
     </div>
 
+    {% if email_not_configured %}
+    <div class="alert alert-warning mb-3" style="margin-bottom:1.25rem;">
+      <span class="alert-icon">⚠️</span>
+      <span>
+        No email provider is configured (<code>EMAIL_HOST</code> is unset) — interview
+        invites and outcome emails will appear to send but won't actually be
+        delivered to candidates who haven't connected via Google. Set
+        <code>EMAIL_HOST</code>/<code>EMAIL_HOST_USER</code>/<code>EMAIL_HOST_PASSWORD</code>
+        (a transactional provider like Resend/SendGrid/SES) in your environment.
+      </span>
+    </div>
+    {% endif %}
+
     <!-- ── Stats ── -->
     <div class="stats-grid animate-fade-up">
       <div class="card stat-card card-glow">
@@ -114,6 +127,9 @@
                 {% if c.sheet_url %}
                 <a href="{{ c.sheet_url }}" target="_blank" style="font-size:0.8rem; color:var(--accent-cyan);">📊 Sheet</a>
                 {% endif %}
+                {% if c.linkedin_post_url %}
+                <a href="{{ c.linkedin_post_url }}" target="_blank" style="font-size:0.8rem; color:var(--accent-cyan);">💼 LinkedIn</a>
+                {% endif %}
               </div>
             </div>
             {% endif %}
@@ -136,6 +152,87 @@
 
       <!-- Right: Quick actions + recent activity -->
       <div style="display:flex; flex-direction:column; gap:1rem;">
+
+        <!-- Integrations — both entirely optional. The app sends real email -->
+        <!-- (with calendar invites attached) and generates JDs with neither -->
+        <!-- connected; these only add sending-as-yourself + a live Sheet -->
+        <!-- (Google) or auto-posting a JD to your own feed (LinkedIn). -->
+        <div class="card animate-fade-up" id="integrations">
+          <div class="card-header">
+            <div class="card-title">Integrations <span style="font-size:0.7rem; font-weight:600; color:var(--text-muted); text-transform:uppercase;">(optional)</span></div>
+          </div>
+          <p style="font-size:0.78rem; color:var(--text-muted); margin-bottom:0.9rem;">
+            Nothing below is required — campaigns launch, invites and outcome
+            emails send, and JDs still generate with neither connected.
+          </p>
+
+          <div style="display:flex; flex-direction:column; gap:0.6rem;">
+            <div style="padding:0.75rem; border:1px solid var(--border); border-radius:var(--radius-sm);">
+              <div class="flex items-center justify-between">
+                <span style="font-size:0.85rem; font-weight:600;">📊 Google</span>
+                {% if has_google %}
+                <span class="badge badge-green" style="font-size:0.68rem;">Connected</span>
+                {% endif %}
+              </div>
+              <p style="font-size:0.75rem; color:var(--text-muted); margin:0.35rem 0 0.6rem;">
+                Send invites/outcomes from your own Gmail address, and get a live
+                tracking Sheet per campaign.
+              </p>
+              {% if has_google %}
+              <form method="POST" action="{% url 'google_disconnect' %}">
+                {% csrf_token %}
+                <button type="submit" class="btn btn-sm btn-outline">Disconnect</button>
+              </form>
+              {% else %}
+              <a href="{% url 'google_connect' %}" class="btn btn-sm btn-outline">Connect Google</a>
+              <div style="font-size:0.7rem; color:var(--text-muted); margin-top:0.4rem;">
+                Google will show an "unverified app" warning until this app
+                finishes Google's review — click Advanced → Continue if you
+                choose to connect; that's expected, not an error.
+              </div>
+              {% endif %}
+            </div>
+
+            <div style="padding:0.75rem; border:1px solid var(--border); border-radius:var(--radius-sm);">
+              <div class="flex items-center justify-between">
+                <span style="font-size:0.85rem; font-weight:600;">💼 LinkedIn</span>
+                {% if has_linkedin %}
+                <span class="badge badge-green" style="font-size:0.68rem;">Connected</span>
+                {% endif %}
+              </div>
+              <p style="font-size:0.75rem; color:var(--text-muted); margin:0.35rem 0 0.6rem;">
+                Optionally post a campaign's JD to your own LinkedIn feed when
+                you launch it.
+              </p>
+              {% if has_linkedin %}
+              <form method="POST" action="{% url 'linkedin_disconnect' %}">
+                {% csrf_token %}
+                <button type="submit" class="btn btn-sm btn-outline">Disconnect</button>
+              </form>
+              {% else %}
+              <a href="{% url 'linkedin_connect' %}" class="btn btn-sm btn-outline">Connect LinkedIn</a>
+              {% endif %}
+
+              <details style="margin-top:0.6rem;">
+                <summary style="font-size:0.72rem; color:var(--text-muted); cursor:pointer;">
+                  {% if has_linkedin %}Token expired? Paste a new one{% else %}Have a token already? Paste it manually{% endif %}
+                </summary>
+                <form method="POST" action="{% url 'linkedin_connect_manual' %}" style="margin-top:0.5rem; display:flex; flex-direction:column; gap:0.4rem;">
+                  {% csrf_token %}
+                  <input type="text" name="access_token" class="form-control" style="font-size:0.75rem; padding:0.4rem 0.6rem;" placeholder="Access token" required>
+                  <input type="text" name="member_id" class="form-control" style="font-size:0.75rem; padding:0.4rem 0.6rem;" placeholder="Member ID or urn:li:person:…" required>
+                  <button type="submit" class="btn btn-sm btn-outline">Save token</button>
+                </form>
+                <p style="font-size:0.68rem; color:var(--text-muted); margin-top:0.4rem;">
+                  From your LinkedIn Developer app → Auth tab → OAuth 2.0 tools →
+                  Token Generator. Skips the consent-screen flow above entirely —
+                  useful if "Share on LinkedIn" isn't approved for your app yet.
+                  Expires in ~60 days; paste a fresh one here when it does.
+                </p>
+              </details>
+            </div>
+          </div>
+        </div>
 
         <!-- Quick Actions -->
         <div class="card animate-fade-up delay-1">
